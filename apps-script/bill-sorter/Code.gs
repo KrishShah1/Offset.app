@@ -11,6 +11,9 @@
  * folder of its own, which you can then rename or merge into an existing property.
  * Every attachment it looks at is written to the Log tab of the same spreadsheet.
  *
+ * Each run stops well inside Apps Script's six-minute limit and the next run carries on
+ * where it left off, so a big backlog takes a few hourly runs instead of one that times out.
+ *
  * Setup: paste this file into an Apps Script project, add the Drive API service,
  * choose setup in the function list and press Run. See README.md for the details.
  */
@@ -24,13 +27,23 @@ const CONFIG = {
   NEEDS_REVIEW: '_Needs Review',         // bills whose property couldn't be worked out
   TIME_ZONE: 'Asia/Kolkata',
   SEARCH_SINCE: '',                      // e.g. '2024/04/01' to leave older mail alone; '' = all of it
+  // Mail with a PDF or photo and one of these words is looked at, and so is mail showing one of
+  // your account numbers and anything you sent or forwarded yourself that mentions a bill.
   SEARCH_TERMS: [
-    'bill', 'invoice', 'receipt', 'maintenance', 'electricity', 'gas', 'water', 'property tax',
-    'broadband', 'internet', 'rent', 'lease', 'insurance', 'repair', 'pest control', 'society',
-    'adani', 'mahanagar gas', 'airtel', 'jio',
+    'electricity', 'adani', 'tata power', 'mahavitaran', 'msedcl', 'best undertaking', 'mahanagar gas',
+    'mgl', 'gas bill', 'water bill', 'water charges', 'property tax', 'municipal', 'mcgm', 'maintenance',
+    'society', 'chs', 'sinking fund', 'broadband', 'fibernet', 'airtel', 'jio', 'rent', 'lease',
+    'leave and licence', 'tenant', 'insurance', 'repair', 'plumbing', 'pest control', 'termite',
   ],
-  THREADS_PER_RUN: 50,
-  MAX_RUN_MS: 3.5 * 60 * 1000,           // keeps hourly runs inside the 90 min/day trigger quota
+  // Opening an attachment (Drive's OCR) is the slow part: seconds to a minute each.
+  // 'when-needed' opens one only when the email alone can't say whose bill it is, which is fast;
+  // 'always' opens every one, which is slower but takes the bill month from the bill itself.
+  READ_ATTACHMENTS: 'when-needed',
+  READ_MAX_MB: 5,                        // bigger files are sorted from the email without opening them
+  READ_MAX_PAGES: 10,                    // and so are long PDFs; bills are a page or two
+  RUN_MINUTES: 3.5,                      // no new email is started after this long...
+  READ_CUTOFF_MINUTES: 3.75,             // ...and no attachment opened; Apps Script stops a run at 6
+  DAILY_MINUTES: 80,                     // scheduled runs stop for the day here (Google allows 90)
   MAX_ATTEMPTS: 3,                       // a thread that errors this many runs in a row is labelled anyway
   OCR_LANGUAGE: 'en',
 };
@@ -61,64 +74,66 @@ const STARTING_PROPERTIES = [
 // anywhere in the From line.
 // inArrears: the bill charges for usage before it was issued, so one dated in April (or one that
 // arrives in April without saying which month it is for) is filed as March's bill.
+// newProperty: an unknown account on this kind of bill starts a new property. Phone, insurance,
+// rent and repair bills don't, since plenty of those (your own mobile, your car) aren't about a property.
 const UTILITIES = [
   {
-    folder: 'Electricity Bills', label: 'Electricity Bill', short: 'Electricity', inArrears: true,
+    folder: 'Electricity Bills', label: 'Electricity Bill', short: 'Electricity', inArrears: true, newProperty: true,
     senders: ['adani', 'tatapower', 'bestundertaking', 'mahadiscom', 'mahavitaran', 'torrentpower'],
     keywords: ['electricity', 'adani electricity', 'tata power', 'best undertaking', 'mahavitaran', 'msedcl',
       'torrent power', 'energy charges', 'units consumed', 'kwh', 'meter reading', 'sanctioned load', 'ebill'],
   },
   {
-    folder: 'Gas Bills', label: 'Gas Bill', short: 'Gas', inArrears: true,
+    folder: 'Gas Bills', label: 'Gas Bill', short: 'Gas', inArrears: true, newProperty: true,
     senders: ['mahanagargas'],
     keywords: ['mahanagar gas', 'mgl', 'piped natural gas', 'png bill', 'gas bill', 'gas consumption', 'scm',
       'gas meter', 'adani total gas', 'gujarat gas', 'indraprastha gas'],
   },
   {
-    folder: 'Water Bills', label: 'Water Bill', short: 'Water', inArrears: true,
+    folder: 'Water Bills', label: 'Water Bill', short: 'Water', inArrears: true, newProperty: true,
     senders: [],
     keywords: ['water bill', 'water charges', 'water supply', 'water connection', 'water meter',
       'water consumption', 'sewerage charges', 'hydraulic engineer'],
   },
   {
-    folder: 'Internet & Telecom', label: 'Internet & Phone Bill', short: 'Internet', inArrears: true,
+    folder: 'Internet & Telecom', label: 'Internet & Phone Bill', short: 'Internet', inArrears: true, newProperty: false,
     senders: ['airtel.in', 'airtel.com', 'jio.com', 'mtnl', 'bsnl', 'actcorp', 'hathway', 'tataplay', 'excitel'],
     keywords: ['broadband', 'fibernet', 'jiofiber', 'jio', 'airtel', 'xstream', 'postpaid', 'landline', 'mtnl',
       'bsnl', 'hathway', 'internet bill', 'internet plan', 'internet service', 'data usage', 'wifi',
       'telephone bill', 'mobile bill'],
   },
   {
-    folder: 'Property Taxes', label: 'Property Tax', short: 'Property Tax', inArrears: false,
+    folder: 'Property Taxes', label: 'Property Tax', short: 'Property Tax', inArrears: false, newProperty: true,
     senders: ['ptax'],
     keywords: ['property tax', 'municipal tax', 'capital value', 'general tax', 'assessment', 'tax bill',
       'education cess', 'tree cess', 'street tax', 'property account'],
   },
   {
-    folder: 'Property Insurance', label: 'Insurance', short: 'Insurance', inArrears: false,
+    folder: 'Property Insurance', label: 'Insurance', short: 'Insurance', inArrears: false, newProperty: false,
     senders: [],
     keywords: ['insurance', 'policy schedule', 'policy no', 'policy number', 'sum insured', 'premium',
       'home insurance', 'fire insurance', 'insured', 'insurer'],
   },
   {
-    folder: 'Lease & Rent Agreements', label: 'Rent', short: 'Rent', inArrears: false,
+    folder: 'Lease & Rent Agreements', label: 'Rent', short: 'Rent', inArrears: false, newProperty: false,
     senders: [],
     keywords: ['rent receipt', 'rent agreement', 'rental agreement', 'monthly rent', 'rent for the month',
       'house rent', 'rent paid', 'leave and licence', 'leave and license', 'leave & licence', 'leave & license',
       'licensee', 'licensor', 'lease', 'tenant', 'tenancy'],
   },
   {
-    folder: 'Repairs & Maintenance', label: 'Repairs', short: 'Repairs', inArrears: false,
+    folder: 'Repairs & Maintenance', label: 'Repairs', short: 'Repairs', inArrears: false, newProperty: false,
     senders: [],
     keywords: ['repair work', 'repairs', 'repairing', 'plumbing', 'plumber', 'electrician', 'electrical work',
       'carpentry', 'carpenter', 'painting', 'waterproofing', 'civil work', 'labour charges'],
   },
   {
-    folder: 'Pest Control', label: 'Pest Control', short: 'Pest Control', inArrears: false,
+    folder: 'Pest Control', label: 'Pest Control', short: 'Pest Control', inArrears: false, newProperty: false,
     senders: [],
     keywords: ['pest control', 'pest management', 'termite', 'fumigation', 'cockroach', 'rodent', 'bed bug'],
   },
   {
-    folder: 'Society Maintenance', label: 'Maintenance Bill', short: 'Society', inArrears: false,
+    folder: 'Society Maintenance', label: 'Maintenance Bill', short: 'Society', inArrears: false, newProperty: true,
     senders: ['mygate', 'nobrokerhood', 'apnacomplex', 'adda.io', 'chsone'],
     keywords: ['maintenance', 'maintenance bill', 'maintenance charges', 'society maintenance', 'housing society',
       'co operative housing', 'chs', 'sinking fund', 'repair fund', 'service charges', 'non occupancy',
@@ -128,7 +143,8 @@ const UTILITIES = [
 
 // Anything that isn't one of the types above.
 const OTHER = {
-  folder: 'Miscellaneous Bills', label: 'Bill', short: 'Other', inArrears: false, senders: [], keywords: [],
+  folder: 'Miscellaneous Bills', label: 'Bill', short: 'Other', inArrears: false, newProperty: false,
+  senders: [], keywords: [],
 };
 
 // ─── Run these ───────────────────────────────────────────────────────────────
@@ -138,58 +154,129 @@ const OTHER = {
  * hourly run (replacing any earlier schedule for this script) and sorts the first batch.
  */
 function setup() {
-  const ctx = openContext_();
-  ScriptApp.getProjectTriggers()
-    .filter((t) => ['processBills', 'automateBillSorting'].indexOf(t.getHandlerFunction()) !== -1)
-    .forEach((t) => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('processBills').timeBased().everyHours(1).create();
-  console.log('Settings and log: ' + ctx.settings.getUrl());
-  console.log('Bills folder: ' + ctx.base.getUrl());
-  processBills();
+  const ownClock = startClock_();
+  try {
+    const ctx = openContext_();
+    ScriptApp.getProjectTriggers()
+      .filter((t) => ['processBills', 'automateBillSorting'].indexOf(t.getHandlerFunction()) !== -1)
+      .forEach((t) => ScriptApp.deleteTrigger(t));
+    ScriptApp.newTrigger('processBills').timeBased().everyHours(1).create();
+    console.log('Settings and log: ' + ctx.settings.getUrl());
+    console.log('Bills folder: ' + ctx.base.getUrl());
+    processBills();
+  } finally {
+    if (ownClock) clock_.started = null;
+  }
 }
 
-/** The scheduled job. Safe to run by hand at any time. */
-function processBills() {
+/**
+ * The scheduled job, and safe to run by hand at any time: each run stops in good time and
+ * the next one carries on. Running it by hand a few times gets through a backlog faster.
+ */
+function processBills(e) {
+  const ownClock = startClock_();
+  const scheduled = Boolean(e && e.triggerUid);
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(30 * 1000)) {
-    console.log('Another run is still going; skipping this one.');
-    return;
-  }
   try {
-    runBatch_();
+    if (!lock.tryLock(10 * 1000)) {
+      console.log('Another run is still going; skipping this one.');
+      return;
+    }
+    try {
+      if (scheduled && minutesUsedToday_() >= CONFIG.DAILY_MINUTES) {
+        console.log("Today's scheduled time is used up; carrying on tomorrow. Running processBills by hand still works.");
+        return;
+      }
+      runBatch_();
+    } finally {
+      lock.releaseLock();
+      if (scheduled) addMinutesToday_(elapsedMs_());
+    }
   } finally {
-    lock.releaseLock();
+    if (ownClock) clock_.started = null;
   }
 }
 
 /** The old script's name, so a trigger that was set up for it keeps working. */
-function automateBillSorting() {
-  processBills();
+function automateBillSorting(e) {
+  processBills(e);
+}
+
+// ─── Keeping inside Apps Script's limits ─────────────────────────────────────
+
+// When this execution started. setup() starts it before calling processBills(), so the time
+// setup spends counts against the same six minutes.
+const clock_ = { started: null };
+
+function startClock_() {
+  if (clock_.started !== null) return false;
+  clock_.started = Date.now();
+  return true;
+}
+
+function elapsedMs_() {
+  return clock_.started === null ? 0 : Date.now() - clock_.started;
+}
+
+function past_(minutes) {
+  return elapsedMs_() >= minutes * 60 * 1000;
+}
+
+// Scheduled runs share 90 minutes a day on a personal Google account; past that, Google fails
+// every run and emails about it. Counting our own minutes lets the script stop first.
+function minutesUsedToday_() {
+  return Number(PropertiesService.getScriptProperties().getProperty(todayKey_()) || 0);
+}
+
+function addMinutesToday_(ms) {
+  const props = PropertiesService.getScriptProperties();
+  const key = todayKey_();
+  props.getKeys().forEach((k) => {
+    if (k.indexOf('minutes:') === 0 && k !== key) props.deleteProperty(k);
+  });
+  props.setProperty(key, String(minutesUsedToday_() + ms / 60000));
+}
+
+function todayKey_() {
+  return 'minutes:' + Utilities.formatDate(new Date(), CONFIG.TIME_ZONE, 'yyyy-MM-dd');
 }
 
 // ─── One run ─────────────────────────────────────────────────────────────────
 
+// Works through the search 50 threads at a time until the time is up or nothing is left.
 function runBatch_() {
-  const started = Date.now();
   const ctx = openContext_();
-  const threads = GmailApp.search(buildQuery_(ctx.properties), 0, CONFIG.THREADS_PER_RUN);
-  console.log('Threads to look at: ' + threads.length);
-  for (let i = 0; i < threads.length; i++) {
-    if (outOfTime_(started)) {
-      console.log('Out of time; the rest will be picked up on the next run.');
-      return;
+  const query = buildQuery_(ctx.properties);
+  const tried = {};
+  const tally = {};
+  let start = 0;
+  let finished = false;
+  while (!finished && !past_(CONFIG.RUN_MINUTES)) {
+    const page = GmailApp.search(query, start, 50);
+    if (!page.length) {
+      finished = true;
+      break;
     }
-    if (processThread_(threads[i], ctx, started)) threads[i].addLabel(ctx.label);
+    const fresh = page.filter((t) => !tried[t.getId()]);
+    if (!fresh.length) {
+      start += page.length; // threads tried this run that couldn't be labelled: look past them
+      continue;
+    }
+    for (let i = 0; i < fresh.length && !past_(CONFIG.RUN_MINUTES); i++) {
+      tried[fresh[i].getId()] = true;
+      if (processThread_(fresh[i], ctx, tally) === 'done') fresh[i].addLabel(ctx.label);
+    }
   }
-}
-
-function outOfTime_(started) {
-  return Date.now() - started > CONFIG.MAX_RUN_MS;
+  if (!finished) finished = !GmailApp.search(query, 0, 1).length;
+  const counts = Object.keys(tally).map((result) => tally[result] + ' ' + result.toLowerCase()).join(', ');
+  console.log((counts || 'Nothing new') + ' in ' + Math.round(elapsedMs_() / 1000) + 's. ' +
+    (finished ? 'All caught up.' : 'More to do; the next run carries on from here.'));
 }
 
 function buildQuery_(properties) {
   const terms = CONFIG.SEARCH_TERMS.map((term) => (/\s/.test(term) ? '"' + term + '"' : term));
   properties.forEach((p) => p.accounts.forEach((account) => terms.push(account)));
+  terms.push('(from:me bill)');
   // Gmail's search spells a label with spaces as hyphens: "Bill Records" → label:bill-records
   const label = CONFIG.LABEL.toLowerCase().replace(/\s+/g, '-');
   return 'has:attachment -label:' + label +
@@ -198,30 +285,55 @@ function buildQuery_(properties) {
     (CONFIG.SEARCH_SINCE ? ' after:' + CONFIG.SEARCH_SINCE : '');
 }
 
-// Files every bill in the thread. Returns true once the thread is finished with and can be
-// labelled; false leaves it for the next run (out of time, or an error worth retrying).
-function processThread_(thread, ctx, started) {
+// Returns 'done' when every email in the thread is handled and it can be labelled, 'retry'
+// after an error worth trying again, and 'later' when time ran out part way through.
+function processThread_(thread, ctx, tally) {
   let failed = false;
   const messages = thread.getMessages();
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
-    const items = billAttachments_(message);
-    for (let j = 0; j < items.length; j++) {
-      const item = items[j];
-      const key = message.getId() + ':' + item.hash;
-      if (ctx.done.has(key)) continue; // handled on an earlier run
-      if (outOfTime_(started)) return false;
-      try {
-        logRow_(ctx, thread, message, item, handleAttachment_(message, item, ctx), key);
-        ctx.done.add(key);
-      } catch (e) {
-        failed = true;
-        console.log('Error on ' + item.name + ': ' + (e && e.stack ? e.stack : e));
-        logRow_(ctx, thread, message, item, { result: 'Error', notes: String(e && e.message ? e.message : e) }, '');
-      }
-    }
+    if (ctx.doneMessages.has(message.getId())) continue; // handled on an earlier run
+    if (past_(CONFIG.RUN_MINUTES)) return 'later';
+    const state = processMessage_(message, thread, ctx, tally);
+    if (state === 'later') return 'later';
+    if (state === 'failed') failed = true;
   }
-  return failed ? giveUp_(thread) : clearAttempts_(thread);
+  if (failed) return giveUp_(thread) ? 'done' : 'retry';
+  clearAttempts_(thread);
+  return 'done';
+}
+
+// One email, all or nothing: its log rows are written together at the end, so if time runs
+// out part way the whole email is done again next run. Files it saved are recognised then.
+function processMessage_(message, thread, ctx, tally) {
+  const items = billAttachments_(message);
+  const rows = [];
+  const results = [];
+  let failed = false;
+  for (let j = 0; j < items.length; j++) {
+    const item = items[j];
+    const key = message.getId() + ':' + item.hash;
+    if (ctx.done.has(key)) continue;
+    item.count = items.length;
+    let o;
+    try {
+      o = handleAttachment_(message, item, ctx);
+    } catch (e) {
+      console.log('Error on ' + item.name + ': ' + (e && e.stack ? e.stack : e));
+      o = { result: 'Error', notes: String(e && e.message ? e.message : e) };
+    }
+    if (o === null) return 'later'; // no time left to open it
+    if (o.result === 'Error') failed = true;
+    rows.push(logValues_(thread, message, item, o, o.result === 'Error' ? key + ':error' : key));
+    results.push({ key: key, result: o.result });
+  }
+  writeLog_(ctx, rows);
+  results.forEach((r) => {
+    if (r.result !== 'Error') ctx.done.add(r.key);
+    tally[r.result] = (tally[r.result] || 0) + 1;
+  });
+  if (!failed) ctx.doneMessages.add(message.getId());
+  return failed ? 'failed' : 'ok';
 }
 
 function giveUp_(thread) {
@@ -276,18 +388,34 @@ function billType_(contentType, name) {
   return null;
 }
 
+// Sorts one attachment, opening it only if the email alone isn't enough. Returns null when it
+// needs opening but the run is too close to its time limit to start, so it waits for next run.
 function handleAttachment_(message, item, ctx) {
   const blob = item.attachment.copyBlob().setContentType(item.type);
-  const read = readText_(blob, item.name);
-  const v = classify_(textsFor_(message, item, read.text), ctx.properties, message.getDate());
+  const texts = textsFor_(message, item, '');
+  let v = classify_(texts, ctx.properties, message.getDate());
+  let note = '';
+  if (wantsReading_(v, texts, item, ctx)) {
+    const tooMuch = tooMuchToRead_(blob, item);
+    if (tooMuch) {
+      note = 'Not opened (' + tooMuch + '), so this is based on the email.';
+    } else if (past_(CONFIG.READ_CUTOFF_MINUTES)) {
+      return null;
+    } else {
+      const read = readText_(blob, item.name);
+      if (read.error) {
+        note = "Couldn't read the attachment itself (" + read.error + '), so this is based on the email.';
+      } else {
+        texts.doc = normalize_(read.text).slice(0, 30000); // a bill's details are on its first pages
+        v = classify_(texts, ctx.properties, message.getDate());
+      }
+    }
+  }
   const outcome = {
     utility: v.utility.folder,
     fy: v.fy,
     month: MONTHS[v.month.m] + ' ' + v.month.y + ' (' + v.month.how + ')',
-    notes: [
-      v.notes,
-      read.error ? "Couldn't read the attachment itself (" + read.error + '), so this is based on the email.' : '',
-    ].filter(Boolean).join(' '),
+    notes: [v.notes, note].filter(Boolean).join(' '),
   };
   if (v.action === 'skip') return Object.assign(outcome, { result: 'Skipped' });
 
@@ -296,7 +424,7 @@ function handleAttachment_(message, item, ctx) {
   if (v.action === 'new') property = addProperty_(ctx, v.utility, v.account, message.getSubject());
   const top = property ? property.folder : subfolder_(ctx, ctx.base, CONFIG.NEEDS_REVIEW);
   const target = subfolder_(ctx, subfolder_(ctx, top, v.utility.folder), v.fy);
-  const saved = saveFile_(target, blob, v.fileBase + extension_(item), item.hash, message.getId());
+  const saved = saveFile_(ctx, target, blob, v.fileBase + extension_(item), item.hash, message.getId());
   let result = 'Filed';
   if (v.action === 'new') result = 'Filed (new property)';
   if (v.action === 'review') result = 'Needs review';
@@ -305,8 +433,39 @@ function handleAttachment_(message, item, ctx) {
     result: result,
     property: property ? property.name : CONFIG.NEEDS_REVIEW,
     matchedBy: v.action === 'new' ? 'new account ' + v.account : v.action === 'file' ? v.match.why : '',
-    url: saved.file.getUrl(),
+    url: saved.url,
   });
+}
+
+// Whether to open the attachment. Not when the email already names one of your account numbers
+// (unless the email carries several attachments and only opening them shows which is the bill),
+// and not when nothing about the email suggests a property bill at all.
+function wantsReading_(v, t, item, ctx) {
+  if (CONFIG.READ_ATTACHMENTS === 'always') return true;
+  const settled = v.action === 'file' && v.match.score >= 50 && v.utility !== OTHER;
+  if (settled && item.count === 1) return false;
+  const fromMe = Boolean(ctx.me) && t.from.indexOf(ctx.me) !== -1;
+  return settled || fromMe || v.utilityScore >= 2 || Boolean(v.match.property || v.match.ambiguous) ||
+    /(?:^|[^a-z])(?:e-?)?bills?(?![a-z])/.test(t.subject + ' ' + t.file);
+}
+
+// Why an attachment is too much to open, or '' if it isn't. Drive's OCR on big or long files
+// is slow enough to sink a run, and bills are small.
+function tooMuchToRead_(blob, item) {
+  const mb = item.size / (1024 * 1024);
+  if (mb > CONFIG.READ_MAX_MB) return mb.toFixed(1) + ' MB';
+  if (item.type === 'application/pdf') {
+    const pages = pdfPages_(blob);
+    if (pages > CONFIG.READ_MAX_PAGES) return pages + ' pages';
+  }
+  return '';
+}
+
+// Counts "/Type /Page" entries in the raw PDF. Some PDFs pack these away where they can't be
+// counted; those come out as 0 and are opened as normal.
+function pdfPages_(blob) {
+  const found = blob.getDataAsString('ISO-8859-1').match(/\/Type\s*\/Page(?![A-Za-z])/g);
+  return found ? found.length : 0;
 }
 
 function textsFor_(message, item, docText) {
@@ -378,8 +537,8 @@ function classify_(t, properties, arrived) {
   const month = detectBillMonth_(t, utility, arrived);
   const match = matchProperty_(t, properties);
   const v = {
-    utility: utility, month: month, fy: financialYear_(month), fileBase: fileBase_(month, utility),
-    match: match, account: '', action: '', notes: '',
+    utility: utility, utilityScore: found.score, month: month, fy: financialYear_(month),
+    fileBase: fileBase_(month, utility), match: match, account: '', action: '', notes: '',
   };
   if (t.doc.length >= 40 && !BILL_WORDS.test(t.doc)) {
     v.action = 'skip';
@@ -395,6 +554,10 @@ function classify_(t, properties, arrived) {
   } else if (found.score < 4) {
     v.action = 'skip';
     v.notes = 'Not clearly a property bill.';
+  } else if (!utility.newProperty) {
+    v.action = 'skip';
+    v.notes = 'A ' + utility.short.toLowerCase() + ' bill that matches none of your properties. If it is for ' +
+      'one of them, add its account number to that property in the sheet.';
   } else {
     // A bill for a property the sheet doesn't have yet: its account number starts a new one.
     v.account = extractAccount_(t);
@@ -752,11 +915,21 @@ function openContext_() {
     propertySheet: propertiesTab_(settings),
     logSheet: logTab_(settings),
     label: GmailApp.getUserLabelByName(CONFIG.LABEL) || GmailApp.createLabel(CONFIG.LABEL),
+    me: myAddress_(),
     folders: {},
   };
   ctx.properties = loadProperties_(ctx, props);
-  ctx.done = loadDone_(ctx.logSheet);
+  Object.assign(ctx, loadMemory_(ctx.logSheet));
   return ctx;
+}
+
+// Your own address, so bills you forward to yourself are always looked at properly.
+function myAddress_() {
+  try {
+    return String(Session.getEffectiveUser().getEmail() || '').toLowerCase();
+  } catch (e) {
+    return '';
+  }
 }
 
 function baseFolder_(props) {
@@ -914,43 +1087,74 @@ function childFolder_(parent, name) {
   return found.hasNext() ? found.next() : parent.createFolder(name);
 }
 
-// Saves the bill unless the same file is already in the folder. A different bill with the same
-// name gets " (2)", " (3)" and so on.
-function saveFile_(folder, blob, name, hash, messageId) {
-  const taken = {};
-  const files = folder.getFiles();
-  while (files.hasNext()) {
-    const file = files.next();
-    if (file.isTrashed()) continue;
-    if (String(file.getDescription() || '').indexOf('sha1=' + hash) !== -1) return { file: file, duplicate: true };
-    taken[file.getName()] = true;
-  }
+// Saves the bill unless the same file has been filed before. The log says which files those
+// are, so this usually costs no Drive calls at all; a file saved by a run that stopped before
+// writing its log is recognised by its name and the fingerprint in its description. A different
+// bill with the same name gets " (2)", " (3)" and so on.
+function saveFile_(ctx, folder, blob, name, hash, messageId) {
+  if (ctx.filed[hash]) return { url: ctx.filed[hash], duplicate: true };
   const dot = name.lastIndexOf('.');
   let finalName = name;
-  for (let n = 2; taken[finalName]; n++) finalName = name.slice(0, dot) + ' (' + n + ')' + name.slice(dot);
+  for (let n = 2; ; n++) {
+    const sameName = folder.getFilesByName(finalName);
+    let taken = false;
+    while (sameName.hasNext()) {
+      const file = sameName.next();
+      if (file.isTrashed()) continue;
+      taken = true;
+      const description = String(file.getDescription() || '');
+      if (description.indexOf('sha1=' + hash) !== -1) {
+        ctx.filed[hash] = file.getUrl();
+        // Saved for this same email by a run that ran out of time: that's this filing, not a copy.
+        return { url: ctx.filed[hash], duplicate: description.indexOf(messageId) === -1 };
+      }
+    }
+    if (!taken) break;
+    finalName = name.slice(0, dot) + ' (' + n + ')' + name.slice(dot);
+  }
   const file = folder.createFile(blob.setName(finalName));
   file.setDescription('Filed by Bill Sorter from Gmail message ' + messageId + '. sha1=' + hash);
-  return { file: file, duplicate: false };
+  ctx.filed[hash] = file.getUrl();
+  return { url: ctx.filed[hash], duplicate: false };
 }
 
-// Attachments already in the log (other than errors) are never looked at again.
-function loadDone_(logSheet) {
-  const done = new Set();
+// What earlier runs did, from the Log tab: the attachments handled (never looked at again), the
+// emails finished with (their attachments aren't even downloaded again), and the files filed.
+function loadMemory_(logSheet) {
+  const memory = { done: new Set(), doneMessages: new Set(), filed: {} };
   const last = logSheet.getLastRow();
-  if (last < 2) return done;
-  logSheet.getRange(2, LOG_HEADERS.indexOf('Key') + 1, last - 1, 1).getValues()
-    .forEach((row) => {
-      if (row[0]) done.add(String(row[0]));
-    });
-  return done;
+  if (last < 2) return memory;
+  const first = LOG_HEADERS.indexOf('Result');
+  const col = (name) => LOG_HEADERS.indexOf(name) - first;
+  const failed = {};
+  logSheet.getRange(2, first + 1, last - 1, LOG_HEADERS.length - first).getValues().forEach((row) => {
+    const parts = String(row[col('Key')] || '').split(':'); // message id : file fingerprint [: error]
+    if (parts.length < 2) return;
+    if (parts[2] === 'error') {
+      failed[parts[0]] = true;
+      return;
+    }
+    memory.done.add(parts[0] + ':' + parts[1]);
+    memory.doneMessages.add(parts[0]);
+    const url = String(row[col('Drive file')] || '');
+    if (url && row[col('Result')] !== 'Skipped') memory.filed[parts[1]] = url;
+  });
+  Object.keys(failed).forEach((id) => memory.doneMessages.delete(id));
+  return memory;
 }
 
-function logRow_(ctx, thread, message, item, o, key) {
-  ctx.logSheet.appendRow([
+function logValues_(thread, message, item, o, key) {
+  return [
     new Date(), message.getDate(), cell_(message.getFrom()), cell_(message.getSubject()), cell_(item.name),
     o.result, cell_(o.property || ''), o.utility || '', o.fy || '', o.month || '', cell_(o.matchedBy || ''),
     o.url || '', thread.getPermalink(), cell_(o.notes || ''), key,
-  ]);
+  ];
+}
+
+function writeLog_(ctx, rows) {
+  if (!rows.length) return;
+  const sheet = ctx.logSheet;
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, LOG_HEADERS.length).setValues(rows);
 }
 
 // Sheets would run text that starts like a formula; an apostrophe in front keeps it as text.

@@ -32,8 +32,26 @@ Do this on a computer; the Apps Script editor is hard to use on a phone.
 
 `setup` creates the **Property Bills** folder and the **Bill Sorter Settings** spreadsheet,
 schedules a run every hour (replacing the old script's schedule) and sorts the first batch.
-It works back through older mail about 50 conversations per run. To stop it going back that far,
-set `SEARCH_SINCE` in `CONFIG`, e.g. `'2024/04/01'`.
+To stop it going back through old mail, set `SEARCH_SINCE` in `CONFIG`, e.g. `'2024/04/01'`.
+
+## How long it takes
+
+Apps Script stops any run at six minutes, so this one never tries to do everything at once.
+Each run stops starting new work after about 3½ minutes, saves what it did, and the next hourly
+run carries on from there. Nothing is lost or filed twice when a run stops part way. The last
+line of each run's log says either `All caught up.` or `More to do`.
+
+- **Opening an attachment is the slow part:** Drive's OCR takes seconds to a minute per file.
+  So it only opens one when the email alone can't place it. A bill whose email shows one of your
+  account numbers is filed straight away, and an email with nothing to suggest a property bill
+  (a shopping invoice, say) is skipped without opening. Set `READ_ATTACHMENTS` to `'always'` to
+  open every one: slower, but the bill month then always comes from the bill itself.
+- Files over 5 MB and PDFs over 10 pages are never opened; they're sorted from their email.
+- To clear a big backlog faster, run **processBills** by hand a few times. Each run takes up to
+  about four minutes.
+- Google gives scheduled runs 90 minutes a day on a personal account. The script stops its
+  scheduled runs for the day at 80, rather than letting Google fail them and email you about it,
+  and carries on the next day. Runs you start by hand don't count.
 
 ## Using it
 
@@ -58,7 +76,7 @@ financial year it chose and why, and what it matched on. The results:
 | Filed (new property) | Started a new property row and folder |
 | Needs review | In `_Needs Review`: no known account or keyword, or two properties matched equally |
 | Duplicate | The same file is already there |
-| Skipped | Not a property bill: shopping invoices, restaurant bills, terms and conditions |
+| Skipped | Not a property bill: shopping invoices, restaurant bills, terms and conditions, or a phone, insurance or rent bill that matches none of your properties |
 | Error | Something failed; it tries again next run, up to three times |
 
 **_Needs Review.** Move the file by hand, then add the account number or a keyword to the right
@@ -69,8 +87,9 @@ it in Gmail. If its earlier copy is in the wrong folder, delete that.
 
 ## How it decides
 
-- **Reading the bill.** Each PDF or photo is turned into a temporary Google Doc by Drive's OCR,
-  read, and deleted. If that fails it sorts from the email alone, and the log says so.
+- **Reading the bill.** When it needs to, it turns the PDF or photo into a temporary Google Doc
+  with Drive's OCR, reads it, and deletes it. If that fails, or the file is too big to open, it
+  sorts from the email alone and the log's Notes say so.
 - **Utility.** The sender, subject, bill and email are checked against the keywords for each type
   in `UTILITIES` at the top of `Code.gs`; the strongest evidence wins.
 - **Month.** The "Bill Month" printed on the bill, else its billing period, a month in the subject,

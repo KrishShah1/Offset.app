@@ -1,6 +1,6 @@
 // The Gmail → Drive bill sorter, apps-script/bill-sorter/Code.gs. Apps Script can't run here,
 // so the script is loaded unchanged into a node vm next to in-memory stand-ins for Gmail, Drive
-// (and its OCR), Docs, Sheets, script properties, locks and triggers. Plain node runs it:
+// (and its OCR), Docs, Sheets, script properties, locks, triggers and the clock. Plain node:
 //   node tests/logic/billsorter.test.mjs
 import fs from 'node:fs'
 import vm from 'node:vm'
@@ -15,10 +15,15 @@ const has = (n, list, item) => ok(n, list.includes(item), `${JSON.stringify(item
 
 const GOOGLE_DOCS = 'application/vnd.google-apps.document'
 const MON3 = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+const MB = 1024 * 1024
 
-// One Google account: Gmail, Drive and the rest, empty until a test fills it.
+// One Google account: Gmail, Drive and the rest, empty until a test fills it. The clock only
+// moves when a test gives Gmail and Drive calls a cost, so timing is exact and repeatable.
 function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
-  const w = { queries: [], logs: [], ocrCalls: 0, failCreateFile: false }
+  const w = {
+    queries: [], logs: [], ocrCalls: 0, read: [], failCreateFile: false,
+    now: 0, costs: { read: 0, save: 0, fetch: 0 },
+  }
   let seq = 0
   const nextId = (p) => `${p}${++seq}`
   const iter = (list) => { let i = 0; return { hasNext: () => i < list.length, next: () => list[i++] } }
@@ -39,7 +44,9 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
       getFoldersByName: (v) => iter(kids(n).filter((x) => x.kind === 'folder' && x.name === v && !x.trashed)),
       createFolder: (v) => node('folder', v, n),
       getFiles: () => iter(kids(n).filter((x) => x.kind === 'file')),
+      getFilesByName: (v) => iter(kids(n).filter((x) => x.kind === 'file' && x.name === v)),
       createFile: (blob) => {
+        w.now += w.costs.save
         if (w.failCreateFile) throw new Error('Drive is having a moment')
         return node('file', blob.getName(), n, { mime: blob.getContentType(), text: blob.text })
       },
@@ -65,6 +72,9 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
   // Drive's conversion: only a Google Doc target is converted (and OCR'd); v2 converts on ocr: true.
   const docs = new Map()
   const convert = (name, blob) => {
+    w.ocrCalls++
+    w.read.push(blob.name)
+    w.now += w.costs.read
     if (blob.unreadable) throw new Error('Unable to convert the file')
     const f = node('file', name, root, { mime: GOOGLE_DOCS })
     docs.set(f.id, blob.text)
@@ -72,12 +82,10 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
   }
   const Drive = { Files: { remove: (id) => { const n = items.get(id); if (n) n.deleted = true; docs.delete(id) } } }
   if (driveVersion === 3) Drive.Files.create = (meta, blob) => {
-    w.ocrCalls++
     if (meta.mimeType === GOOGLE_DOCS) return convert(meta.name, blob)
     return { id: node('file', meta.name, root, { mime: meta.mimeType }).id }
   }
   if (driveVersion === 2) Drive.Files.insert = (meta, blob, opts) => {
-    w.ocrCalls++
     if (opts && opts.ocr) return convert(meta.title, blob)
     return { id: node('file', meta.title, root, { mime: meta.mimeType }).id }
   }
@@ -87,11 +95,13 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
       return { getBody: () => ({ getText: () => docs.get(id) }) }
     },
   }
-  const blob = (name, type, text, unreadable) => {
-    const b = { name, type, text, unreadable }
+  const blob = (a) => {
+    const b = { name: a.name, type: a.type, text: a.text ?? '', unreadable: !!a.unreadable }
     return Object.assign(b, {
       getName: () => b.name, setName: (v) => { b.name = v; return b },
       getContentType: () => b.type, setContentType: (v) => { b.type = v; return b },
+      // What a PDF's raw bytes look like to the page counter: one "/Type /Page" per page.
+      getDataAsString: () => '%PDF-1.4\n<< /Type /Pages /Count 9 >>\n' + '<< /Type /Page >>\n'.repeat(a.pages ?? 1),
     })
   }
 
@@ -112,16 +122,18 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
     getContentType: () => a.type,
     getSize: () => a.size ?? 80 * 1024,
     getHash: () => crypto.createHash('sha1').update(a.name + '\n' + (a.text ?? '')).digest('hex'),
-    copyBlob: () => blob(a.name, a.type, a.text ?? '', !!a.unreadable),
+    copyBlob: () => blob(a),
   })
   const message = (m) => {
-    const msg = { id: nextId('msg'), labels: new Set(), ...m }
+    const msg = { id: nextId('msg'), labels: new Set(), fetched: 0, ...m }
     return Object.assign(msg, {
       getId: () => msg.id, getDate: () => new Date(msg.date), getFrom: () => msg.from,
       getSubject: () => msg.subject, getPlainBody: () => msg.body ?? '',
-      getAttachments: (opts = {}) => msg.attachments
-        .filter((a) => opts.includeInlineImages !== false || !a.inline)
-        .map(attachment),
+      getAttachments: (opts = {}) => {
+        msg.fetched++
+        w.now += w.costs.fetch
+        return msg.attachments.filter((a) => opts.includeInlineImages !== false || !a.inline).map(attachment)
+      },
     })
   }
   w.thread = (...msgs) => {
@@ -194,6 +206,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
       getProperty: (k) => (store.has(k) ? store.get(k) : null),
       setProperty: (k, v) => { store.set(k, String(v)) },
       deleteProperty: (k) => { store.delete(k) },
+      getKeys: () => [...store.keys()],
     }),
   }
   const triggers = []
@@ -210,10 +223,11 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
   }
   const Utilities = {
     formatDate: (date, tz, fmt) => {
-      const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB', { timeZone: tz, year: 'numeric', month: '2-digit', day: 'numeric' })
+      const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' })
         .formatToParts(date).map((x) => [x.type, x.value]))
       if (fmt === 'yyyy-MM') return `${p.year}-${p.month}`
-      if (fmt === 'd MMM yyyy') return `${p.day} ${MON3[Number(p.month) - 1]} ${p.year}`
+      if (fmt === 'yyyy-MM-dd') return `${p.year}-${p.month}-${p.day}`
+      if (fmt === 'd MMM yyyy') return `${Number(p.day)} ${MON3[Number(p.month) - 1]} ${p.year}`
       throw new Error('Utilities.formatDate not mocked for ' + fmt)
     },
   }
@@ -221,11 +235,14 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
   const sandbox = {
     GmailApp, DriveApp, DocumentApp, SpreadsheetApp, PropertiesService, ScriptApp, Utilities,
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
+    Session: { getEffectiveUser: () => ({ getEmail: () => 'Me@Example.com' }) },
     MimeType: { GOOGLE_DOCS },
     console: { log: (...a) => w.logs.push(a.join(' ')) },
+    __now: () => w.now,
   }
   if (withDrive) sandbox.Drive = Drive
   const ctx = vm.createContext(sandbox)
+  vm.runInContext('Date.now = function () { return __now(); };', ctx)
   vm.runInContext(CODE, ctx)
   w.label = vm.runInContext('CONFIG.LABEL', ctx)
 
@@ -250,6 +267,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
       return w.tab('Log').rows.slice(1).map((r) => Object.fromEntries(headers.map((h, i) => [h, r[i]])))
     },
     leftoverOcrDocs: () => [...items.values()].filter((x) => !x.deleted && /^Bill Sorter OCR/.test(x.name)).length,
+    pending: () => threads.filter((t) => t.messages.some((m) => !m.labels.has(w.label))).length,
   })
   return w
 }
@@ -261,6 +279,7 @@ const BASE = 'Property Bills'
 const ML = "2, Mother's Love, (Malad West)"
 const SP = 'F-34, Sej Plaza, (Malad West)'
 const SD = '202, B-Wing, Sai Dam Towers, (Kandivali West)'
+const P = (...parts) => [BASE, ...parts].join('/')
 
 function fillMailbox(w) {
   const t = {}
@@ -312,8 +331,8 @@ Supply address: B-0202, SAI DHAM TOWERS
 Amount payable 1,700.00`)],
   })
   t.photo = w.thread({
-    from: 'Me <me@example.com>', subject: 'Fwd: bill', date: '2026-06-10T09:00:00+05:30', body: 'sending the bill photo',
-    attachments: [{ name: 'IMG_20260610_101500.jpg', type: 'image/jpeg', size: 2100 * 1024,
+    from: 'Me <me@example.com>', subject: 'Fwd:', date: '2026-06-10T09:00:00+05:30', body: 'sending the photo',
+    attachments: [{ name: 'IMG_20260610_101500.jpg', type: 'image/jpeg', size: 2.1 * MB,
       text: 'ADANI ELECTRICITY\nCA NO 102401902\nBill Date 05/06/2026\nAmount payable 1,800.00' }],
   })
   t.signed = w.thread({
@@ -352,7 +371,7 @@ Amount payable 2,500.00`)],
     attachments: [pdf('Bill_77.pdf', 'Hotel Sunshine, Marve Road, Malad West\nBill No 77\nTotal 1,250.00')],
   })
   t.unreadable = w.thread({
-    from: ADANI, subject: 'Adani Electricity Bill for CA No. 153541273', date: '2026-06-06T09:00:00+05:30',
+    from: ADANI, subject: 'Your Adani Electricity bill', date: '2026-06-06T09:00:00+05:30',
     body: 'Please find attached your bill.',
     attachments: [pdf('Scan.pdf', '', { unreadable: true })],
   })
@@ -496,19 +515,18 @@ console.log('\n── THE FIRST RUN ──')
 const mail = fillMailbox(w)
 w.run('processBills()')
 const paths = w.paths()
-const P = (...parts) => [BASE, ...parts].join('/')
 has('the settings spreadsheet is in the bills folder', paths, P('Bill Sorter Settings'))
 has('the Sai Dham April bill', paths, P(SD, 'Electricity Bills', 'FY 2026-27', '2026-04 April 2026 Electricity Bill.pdf'))
 has('the society bill under Society Maintenance, not Lease & Rent', paths, P(SD, 'Society Maintenance', 'FY 2026-27', '2026-04 April 2026 Maintenance Bill.pdf'))
 has('the property tax bill under Property Taxes, not Gas', paths, P(ML, 'Property Taxes', 'FY 2026-27', '2026-04 April 2026 Property Tax.pdf'))
 has('"a bill of 3,450" stays with Sai Dham', paths, P(SD, 'Electricity Bills', 'FY 2026-27', '2026-05 May 2026 Electricity Bill.pdf'))
 has('the bill that mentions your mailing address is filed, not dropped', paths, P(SD, 'Electricity Bills', 'FY 2026-27', '2026-06 June 2026 Electricity Bill.pdf'))
-has('the phone photo is read and filed with its property', paths, P(ML, 'Electricity Bills', 'FY 2026-27', '2026-05 May 2026 Electricity Bill.jpg'))
+has('the photo you forwarded is read and filed with its property', paths, P(ML, 'Electricity Bills', 'FY 2026-27', '2026-05 May 2026 Electricity Bill.jpg'))
 has('the signed e-bill is filed, not skipped', paths, P(ML, 'Electricity Bills', 'FY 2026-27', '2026-06 June 2026 Electricity Bill.pdf'))
 has('an unknown account starts a new property', paths, P('New property - Electricity 900012345678', 'Electricity Bills', 'FY 2026-27', '2026-05 May 2026 Electricity Bill.pdf'))
 has('and its next bill joins it', paths, P('New property - Electricity 900012345678', 'Electricity Bills', 'FY 2026-27', '2026-06 June 2026 Electricity Bill.pdf'))
 has('a gas bill with no account goes to Needs Review', paths, P('_Needs Review', 'Gas Bills', 'FY 2026-27', '2026-05 May 2026 Gas Bill.pdf'))
-has('an unreadable scan is still filed from the email', paths, P(SP, 'Electricity Bills', 'FY 2026-27', '2026-05 May 2026 Electricity Bill.pdf'))
+has('an unreadable scan with nothing in the email to place it goes to Needs Review', paths, P('_Needs Review', 'Electricity Bills', 'FY 2026-27', '2026-05 May 2026 Electricity Bill.pdf'))
 has('the July bill next to the banner', paths, P(ML, 'Electricity Bills', 'FY 2026-27', '2026-07 July 2026 Electricity Bill.pdf'))
 has('a bill that matches two properties equally goes to Needs Review', paths, P('_Needs Review', 'Repairs & Maintenance', 'FY 2026-27', '2026-06 June 2026 Repairs.pdf'))
 eq('and nothing else was filed (no Amazon, restaurant, terms, banner or logo)', paths.length, 14)
@@ -518,8 +536,9 @@ const log = w.log()
 const row = (attachment) => log.find((r) => r.Attachment === attachment) || {}
 eq('every bill-shaped attachment is in the log', log.length, 16)
 eq('the April bill: filed', row('Bill_151759775.pdf').Result, 'Filed')
-eq('with how it was matched', row('Bill_151759775.pdf')['Matched by'].split(',')[0], 'account 151759775')
-eq('and where the month came from', row('Bill_151759775.pdf')['Bill month'], 'April 2026 (Bill Month on the bill)')
+eq('matched on the account number in the subject', row('Bill_151759775.pdf')['Matched by'], 'account 151759775')
+eq('its month from when it arrived, as the email doesn\'t say', row('Bill_151759775.pdf')['Bill month'], 'April 2026 (month before the email arrived)')
+eq('a bill that was opened takes its month from the bill', row('Maintenance_Q1.pdf')['Bill month'], 'April 2026 (billing period on the bill)')
 eq('the Tata Power bill made a new property', row('TPC_Bill.pdf').Result, 'Filed (new property)')
 eq('the next one was simply filed', row('TPC_Bill_June.pdf').Result, 'Filed')
 eq('Amazon was skipped', row('Invoice_402.pdf').Result, 'Skipped')
@@ -533,11 +552,22 @@ ok('mail the old script already labelled "Bill Records" is left alone', !row('Ol
 ok('each row links to its email', /^https:\/\/mail\.google\.com\//.test(row('MGL.pdf').Email))
 ok('and to its file in Drive', /^https:\/\/drive\.google\.com\//.test(row('MGL.pdf')['Drive file']))
 
+console.log('\n── OPENING ONLY WHAT NEEDS OPENING ──')
+for (const name of ['Bill_151759775.pdf', 'Bill.pdf', 'Bill_June.pdf', 'eBill_Signed.pdf']) {
+  ok(`${name}: the account number is in the email, so it is filed without opening it`, !w.read.includes(name), JSON.stringify(w.read))
+}
+ok('Amazon\'s invoice isn\'t opened: nothing about the email says property bill', !w.read.includes('Invoice_402.pdf'))
+for (const name of ['IMG_20260610_101500.jpg', 'Maintenance_Q1.pdf', 'PTax_Bill.pdf', 'TPC_Bill.pdf', 'MGL.pdf', 'Invoice_88.pdf']) {
+  ok(`${name}: the email alone can't place it, so it is opened`, w.read.includes(name), JSON.stringify(w.read))
+}
+ok('an email with two PDFs has both opened, to tell the bill from the terms', w.read.includes('Bill_July.pdf') && w.read.includes('Terms.pdf'))
+eq('eleven attachments opened out of sixteen', w.ocrCalls, 11)
+
 const propsTab = w.tab('Properties').rows
 eq('the properties tab starts with your three properties and gains the new one', propsTab.length, 5)
 eq('the new one is named after its account', propsTab[4][0], 'New property - Electricity 900012345678')
 eq('with the account number filled in', propsTab[4][1], '900012345678')
-ok('and a note saying where it came from', /^Added automatically on \d+ \w+ 2026 from "Your Tata Power bill"/.test(propsTab[4][4]), propsTab[4][4])
+ok('and a note saying where it came from', /^Added automatically on \d+ \w+ 20\d\d from "Your Tata Power bill"/.test(propsTab[4][4]), propsTab[4][4])
 ok('every property row has its folder ID', propsTab.slice(1).every((r) => /^folder\d+$/.test(r[3])), JSON.stringify(propsTab.map((r) => r[3])))
 eq('the Gmail label is still "Bill Records"', w.label, 'Bill Records')
 ok('every thread is labelled', w.threads.every((t) => t.messages.every((m) => m.labels.has(w.label))))
@@ -545,7 +575,9 @@ const q = w.queries[0]
 ok('the search leaves labelled mail out', q.includes('-label:bill-records'), q)
 ok('looks for PDFs and photos', q.includes('(filename:pdf OR filename:jpg OR filename:jpeg OR filename:png)'), q)
 ok('quotes phrases', q.includes('"property tax"'), q)
-ok('and includes your account numbers', q.includes('102401902') && q.includes('149209100000059'), q)
+ok('includes your account numbers', q.includes('102401902') && q.includes('149209100000059'), q)
+ok('and bills you sent or forwarded yourself', q.includes('(from:me bill)'), q)
+ok('the run ends with a summary', w.logs.some((l) => /^\d+ filed.* All caught up\.$/.test(l)), JSON.stringify(w.logs.slice(-2)))
 
 console.log('\n── RUNNING AGAIN ──')
 const ocrBefore = w.ocrCalls
@@ -559,9 +591,11 @@ mail.adaniApril.receive({
   body: 'Please find attached your bill.',
   attachments: [pdf('Bill_151759775.pdf', 'Adani Electricity\nCA No: 151759775\nBill Month: JUL-2026\nAmount payable 2,300.00')],
 })
+const oldMessage = mail.adaniApril.messages[0]
+const fetchedBefore = oldMessage.fetched
 w.run('processBills()')
 has('a new bill arriving in an old thread is filed', w.paths(), P(SD, 'Electricity Bills', 'FY 2026-27', '2026-07 July 2026 Electricity Bill.pdf'))
-eq('and only the new message was read', w.ocrCalls, ocrBefore + 1)
+eq('the earlier email in that thread isn\'t downloaded again', oldMessage.fetched, fetchedBefore)
 eq('one new log row', w.log().length, 17)
 
 w.thread({
@@ -633,6 +667,84 @@ ok('a third failure gives up and labels it, so it can\'t block the queue', broke
 eq('with three errors in the log', w.log().filter((r) => r.Attachment === 'Bill_Sep.pdf' && r.Result === 'Error').length, 3)
 w.failCreateFile = false
 
+console.log('\n── STAYING INSIDE THE SIX MINUTES ──')
+// Every opened attachment costs 50 seconds, every download 1, every save 2: slow enough that a
+// run can only get through a few, as on a bad day for Drive.
+const slow = makeWorld()
+Object.assign(slow.costs, { read: 50 * 1000, fetch: 1000, save: 2000 })
+const tataBill = (n, extra = {}) => pdf(`TPC_${n}.pdf`, `The Tata Power Company Ltd\nELECTRICITY BILL\nConsumer No: 900012345678\nBill No ${n}\nBill Month: MAY-2026\nAmount payable ${1000 + n}.00`, extra)
+for (let n = 1; n <= 3; n++) {
+  slow.thread({ from: 'Tata Power <bills@tatapower.com>', subject: `Tata Power bill ${n}`, date: '2026-06-03T09:00:00+05:30', body: 'Attached.', attachments: [tataBill(n)] })
+}
+const triple = slow.thread({
+  from: 'Tata Power <bills@tatapower.com>', subject: 'Three Tata Power bills', date: '2026-06-03T09:00:00+05:30', body: 'Attached.',
+  attachments: [tataBill(11), tataBill(12), tataBill(13)],
+})
+for (let n = 4; n <= 9; n++) {
+  slow.thread({ from: 'Tata Power <bills@tatapower.com>', subject: `Tata Power bill ${n}`, date: '2026-06-03T09:00:00+05:30', body: 'Attached.', attachments: [tataBill(n)] })
+}
+const runs = []
+for (let i = 0; i < 20 && slow.pending(); i++) {
+  const before = slow.now
+  slow.run('processBills()')
+  runs.push((slow.now - before) / 1000)
+}
+ok('a slow backlog is spread over several runs', runs.length > 1, JSON.stringify(runs))
+ok('and no run comes near the six-minute limit', Math.max(...runs) <= 5 * 60, JSON.stringify(runs))
+eq('until every thread is done', slow.pending(), 0)
+const slowFiles = slow.paths().filter((p) => p.endsWith('.pdf'))
+eq('every bill is filed exactly once', slowFiles.length, 12)
+eq('and logged exactly once', slow.log().length, 12)
+ok('all of them as filed', slow.log().every((r) => /^Filed/.test(r.Result)), JSON.stringify(slow.log().map((r) => r.Result)))
+ok('the email with three bills, stopped part way, finished as filed, not as duplicates',
+  slow.log().filter((r) => /^TPC_1[123]\.pdf$/.test(r.Attachment)).every((r) => /^Filed/.test(r.Result)),
+  JSON.stringify(slow.log().filter((r) => /^TPC_1[123]\.pdf$/.test(r.Attachment)).map((r) => r.Result)))
+eq('and logged once each', slow.log().filter((r) => /^TPC_1[123]\.pdf$/.test(r.Attachment)).length, 3)
+ok('a run that stops says there is more to do', slow.logs.some((l) => /More to do/.test(l)))
+ok('and the triple email really was cut off once', triple.messages[0].fetched > 1, String(triple.messages[0].fetched))
+
+const big = makeWorld()
+big.thread({ from: 'Tata Power <bills@tatapower.com>', subject: 'Your Tata Power bill', date: '2026-06-03T09:00:00+05:30', body: 'Attached.',
+  attachments: [pdf('Huge.pdf', 'Consumer No: 900012345678 Bill Month: MAY-2026', { size: 7 * MB })] })
+big.thread({ from: 'Tata Power <bills@tatapower.com>', subject: 'Your Tata Power bill', date: '2026-06-04T09:00:00+05:30', body: 'Attached.',
+  attachments: [pdf('Long.pdf', 'Consumer No: 900012345678 Bill Month: MAY-2026', { pages: 34 })] })
+big.run('processBills()')
+const bigRow = (name) => big.log().find((r) => r.Attachment === name) || {}
+eq('a 7 MB file is never opened', big.read.length, 0)
+ok('and the log says why', /Not opened \(7\.0 MB\)/.test(bigRow('Huge.pdf').Notes), bigRow('Huge.pdf').Notes)
+ok('nor is a 34-page PDF', /Not opened \(34 pages\)/.test(bigRow('Long.pdf').Notes), bigRow('Long.pdf').Notes)
+eq('both are still sorted from their emails', big.paths().filter((p) => p.endsWith('.pdf')).length, 2)
+
+const many = makeWorld()
+for (let n = 0; n < 120; n++) {
+  many.thread({ from: 'Shop <orders@shop.example>', subject: `Rent a car, order ${n}`, date: '2026-06-03T09:00:00+05:30', body: 'Thanks.',
+    attachments: [pdf(`order-${n}.pdf`, `Order ${n} total 500`)] })
+}
+many.run('processBills()')
+eq('one run gets through more than one page of search results', many.pending(), 0)
+eq('without opening any of them', many.read.length, 0)
+ok('each skipped and logged', many.log().length === 120 && many.log().every((r) => r.Result === 'Skipped'))
+
+console.log('\n── GOOGLE\'S DAILY ALLOWANCE ──')
+const day = makeWorld()
+day.thread({ from: ADANI, subject: 'Adani Electricity Bill for CA No. 102401902', date: '2026-07-04T09:00:00+05:30', body: 'Attached.',
+  attachments: [pdf('Bill.pdf', 'CA No: 102401902\nBill Month: JUN-2026\nAmount payable 1,950.00')] })
+const todayKey = day.run('todayKey_()')
+day.store.set(todayKey, '85')
+day.ctx.processBills({ triggerUid: 'hourly' })
+eq('a scheduled run does nothing once today\'s 80 minutes are used', day.pending(), 1)
+day.ctx.processBills()
+eq('a run by hand still works', day.pending(), 0)
+day.store.set(todayKey, '10')
+day.costs.fetch = 30 * 1000
+day.thread({ from: ADANI, subject: 'Adani Electricity Bill for CA No. 102401902', date: '2026-08-04T09:00:00+05:30', body: 'Attached.',
+  attachments: [pdf('Bill2.pdf', 'CA No: 102401902\nBill Month: JUL-2026\nAmount payable 1,970.00')] })
+day.ctx.processBills({ triggerUid: 'hourly' })
+eq('scheduled runs count their minutes', Number(day.store.get(todayKey)), 10.5)
+day.store.set('minutes:2020-01-01', '50')
+day.ctx.processBills({ triggerUid: 'hourly' })
+ok('and old days are forgotten', !day.store.has('minutes:2020-01-01'))
+
 console.log('\n── SETUP ──')
 const s = makeWorld()
 s.triggers.push({ getHandlerFunction: () => 'automateBillSorting' })
@@ -646,6 +758,19 @@ eq('an hourly processBills', `${s.triggers[0].getHandlerFunction()} every ${s.tr
 has('and sorts the first batch straight away', s.paths(), P(ML, 'Electricity Bills', 'FY 2026-27', '2026-06 June 2026 Electricity Bill.pdf'))
 eq('the spreadsheet has just the two tabs', s.book().getSheets().map((x) => x.getName()).join(', '), 'Properties, Log')
 ok('the old function name still works for an old trigger', typeof s.ctx.automateBillSorting === 'function')
+
+console.log('\n── "ALWAYS" OPENS EVERYTHING ──')
+const always = makeWorld()
+always.run("CONFIG.READ_ATTACHMENTS = 'always'")
+fillMailbox(always)
+always.run('processBills()')
+const alwaysRow = (name) => always.log().find((r) => r.Attachment === name) || {}
+eq('then the April bill\'s month comes from the bill itself', alwaysRow('Bill_151759775.pdf')['Bill month'], 'April 2026 (Bill Month on the bill)')
+eq('every attachment is opened', always.ocrCalls, 16)
+const usual = makeWorld()
+fillMailbox(usual)
+usual.run('processBills()')
+eq('and the same bills land in the same places as without opening them all', always.paths().join('\n'), usual.paths().join('\n'))
 
 console.log('\n── DRIVE API V2, OR NONE AT ALL ──')
 const v2 = makeWorld({ driveVersion: 2 })
