@@ -1354,7 +1354,7 @@ function rememberBill_(ctx, v, property, arrived, url) {
 const GUESSED_MONTHS = ['month before the email arrived', 'month the email arrived'];
 
 function isGuess_(month) {
-  return GUESSED_MONTHS.indexOf(month.how) !== -1;
+  return GUESSED_MONTHS.some((guess) => String(month.how).indexOf(guess) === 0);
 }
 
 function ymKey_(month) {
