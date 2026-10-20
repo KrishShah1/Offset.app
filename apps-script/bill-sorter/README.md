@@ -75,12 +75,31 @@ financial year it chose and why, and what it matched on. The results:
 | Filed | In its property's folder |
 | Filed (new property) | Started a new property row and folder |
 | Needs review | In `_Needs Review`: no known account or keyword, or two properties matched equally |
-| Duplicate | The same file is already there |
-| Skipped | Not a property bill: shopping invoices, restaurant bills, terms and conditions, or a phone, insurance or rent bill that matches none of your properties |
+| Duplicate | Already filed: the same file, or the same bill sent again (same bill number, or same account and month) |
+| Skipped | Not a new property bill: payment receipts, reminders, shopping invoices, restaurant bills, terms and conditions, or a phone, insurance or rent bill that matches none of your properties |
 | Error | Something failed; it tries again next run, up to three times |
 
 **_Needs Review.** Move the file by hand, then add the account number or a keyword to the right
 property so the next one goes straight there.
+
+## Duplicates
+
+Each bill is filed once. A second copy is logged as `Duplicate` with a link to the one already
+filed, and not saved, when it is:
+
+- the very same file, wherever it was filed;
+- a bill with the same bill number as one already filed;
+- for a bill with an account number (electricity, gas, water, internet, property tax, society):
+  another one that arrived within 7 days of it, or one for the same account and month.
+
+Payment receipts and reminders (`NOT_A_BILL` in `CONFIG`) are skipped. Two genuinely different
+bills that land on the same name, like two meters at one property, are named by account or bill
+number (`… Electricity Bill - 102401902.pdf`) rather than `(2)`.
+
+**To clear out duplicates from earlier versions**, run **startOver** once. It moves every file
+the script filed to the Drive trash (restorable there for 30 days), empties the Log tab and takes
+the `Bill Records` label off the emails it handled; the next runs sort them all again. Emails the
+old script labelled, and files you added yourself, are left alone.
 
 **To sort an email again**, delete its rows in the Log tab and remove the `Bill Records` label from
 it in Gmail. If its earlier copy is in the wrong folder, delete that.

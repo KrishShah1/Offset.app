@@ -21,7 +21,7 @@ const MB = 1024 * 1024
 // moves when a test gives Gmail and Drive calls a cost, so timing is exact and repeatable.
 function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
   const w = {
-    queries: [], logs: [], ocrCalls: 0, read: [], failCreateFile: false,
+    queries: [], logs: [], ocrCalls: 0, read: [], failCreateFile: false, searches: 0,
     now: 0, costs: { read: 0, save: 0, fetch: 0 },
   }
   let seq = 0
@@ -44,6 +44,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
       getFoldersByName: (v) => iter(kids(n).filter((x) => x.kind === 'folder' && x.name === v && !x.trashed)),
       createFolder: (v) => node('folder', v, n),
       getFiles: () => iter(kids(n).filter((x) => x.kind === 'file')),
+      getFolders: () => iter(kids(n).filter((x) => x.kind === 'folder')),
       getFilesByName: (v) => iter(kids(n).filter((x) => x.kind === 'file' && x.name === v)),
       createFile: (blob) => {
         w.now += w.costs.save
@@ -67,6 +68,13 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
       const n = items.get(id)
       if (!n || n.deleted) throw new Error('No item with the given ID could be found')
       return n
+    },
+    // Only the one query the script makes: fullText contains '<word>' and trashed = false.
+    searchFiles: (q) => {
+      w.searches++
+      const word = /fullText contains '([^']+)'/.exec(q)[1]
+      return iter([...items.values()].filter((x) => x.kind === 'file' && !x.deleted && !x.trashed &&
+        ((x.description || '').includes(word) || x.name.includes(word))))
     },
   }
   // Drive's conversion: only a Google Doc target is converted (and OCR'd); v2 converts on ocr: true.
@@ -110,7 +118,19 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
   const threads = []
   const GmailApp = {
     getUserLabelByName: (name) => labels.get(name) || null,
-    createLabel: (name) => { const l = { getName: () => name }; labels.set(name, l); return l },
+    createLabel: (name) => {
+      const l = {
+        getName: () => name,
+        removeFromThreads: (ts) => {
+          if (ts.length > 100) throw new Error('At most 100 threads at a time')
+          ts.forEach((t) => t.messages.forEach((m) => m.labels.delete(name)))
+          return l
+        },
+      }
+      labels.set(name, l)
+      return l
+    },
+    getThreadById: (id) => threads.find((t) => t.id === id) || null,
     // Gmail matches messages, so a thread comes back while any message in it lacks the label.
     search: (query, start, max) => {
       w.queries.push(query)
@@ -173,6 +193,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
       getName: () => s.name, setName: (v) => { s.name = v; return s },
       getLastRow: () => s.rows.length,
       appendRow: (row) => { s.rows.push([...row]); return s },
+      deleteRows: (at, n) => { s.rows.splice(at - 1, n); return s },
       getRange: (a, b, c, d) => (typeof a === 'string' ? range(1, 1) : range(a, b, c, d)),
       getDataRange: () => range(1, 1, Math.max(1, s.rows.length), Math.max(1, ...s.rows.map((x) => x.length))),
       setFrozenRows: () => s, setColumnWidth: () => s,
@@ -536,8 +557,9 @@ const log = w.log()
 const row = (attachment) => log.find((r) => r.Attachment === attachment) || {}
 eq('every bill-shaped attachment is in the log', log.length, 16)
 eq('the April bill: filed', row('Bill_151759775.pdf').Result, 'Filed')
-eq('matched on the account number in the subject', row('Bill_151759775.pdf')['Matched by'], 'account 151759775')
-eq('its month from when it arrived, as the email doesn\'t say', row('Bill_151759775.pdf')['Bill month'], 'April 2026 (month before the email arrived)')
+eq('matched first on its account number', row('Bill_151759775.pdf')['Matched by'].split(',')[0], 'account 151759775')
+eq('its month read off the bill, as the email doesn\'t say', row('Bill_151759775.pdf')['Bill month'], 'April 2026 (Bill Month on the bill)')
+eq('and its account kept in the log', row('Bill_151759775.pdf').Account, '151759775')
 eq('a bill that was opened takes its month from the bill', row('Maintenance_Q1.pdf')['Bill month'], 'April 2026 (billing period on the bill)')
 eq('the Tata Power bill made a new property', row('TPC_Bill.pdf').Result, 'Filed (new property)')
 eq('the next one was simply filed', row('TPC_Bill_June.pdf').Result, 'Filed')
@@ -553,15 +575,22 @@ ok('each row links to its email', /^https:\/\/mail\.google\.com\//.test(row('MGL
 ok('and to its file in Drive', /^https:\/\/drive\.google\.com\//.test(row('MGL.pdf')['Drive file']))
 
 console.log('\n── OPENING ONLY WHAT NEEDS OPENING ──')
-for (const name of ['Bill_151759775.pdf', 'Bill.pdf', 'Bill_June.pdf', 'eBill_Signed.pdf']) {
-  ok(`${name}: the account number is in the email, so it is filed without opening it`, !w.read.includes(name), JSON.stringify(w.read))
-}
 ok('Amazon\'s invoice isn\'t opened: nothing about the email says property bill', !w.read.includes('Invoice_402.pdf'))
+for (const name of ['Bill_151759775.pdf', 'Bill.pdf', 'eBill_Signed.pdf']) {
+  ok(`${name}: a recurring bill whose email doesn't give the month is opened for it`, w.read.includes(name), JSON.stringify(w.read))
+}
 for (const name of ['IMG_20260610_101500.jpg', 'Maintenance_Q1.pdf', 'PTax_Bill.pdf', 'TPC_Bill.pdf', 'MGL.pdf', 'Invoice_88.pdf']) {
   ok(`${name}: the email alone can't place it, so it is opened`, w.read.includes(name), JSON.stringify(w.read))
 }
 ok('an email with two PDFs has both opened, to tell the bill from the terms', w.read.includes('Bill_July.pdf') && w.read.includes('Terms.pdf'))
-eq('eleven attachments opened out of sixteen', w.ocrCalls, 11)
+{
+  const quick = makeWorld()
+  quick.thread({ from: ADANI, subject: 'Adani Electricity Bill for April 2026, CA No. 151759775', date: '2026-05-03T09:00:00+05:30',
+    body: 'Attached.', attachments: [pdf('Apr.pdf', 'CA No: 151759775 Bill Month: APR-2026 Amount payable 900.00')] })
+  quick.run('processBills()')
+  eq('a bill whose email gives both the account and the month is filed without opening it', quick.read.length, 0)
+  has('in the right place', quick.paths(), P(SD, 'Electricity Bills', 'FY 2026-27', '2026-04 April 2026 Electricity Bill.pdf'))
+}
 
 const propsTab = w.tab('Properties').rows
 eq('the properties tab starts with your three properties and gains the new one', propsTab.length, 5)
@@ -612,7 +641,9 @@ w.thread({
   attachments: [pdf('Revised.pdf', 'Adani Electricity\nCA No: 102401902\nBill Month: JUN-2026\nRevised amount payable 1,890.00')],
 })
 w.run('processBills()')
-has('a different bill for the same month gets "(2)", not overwritten', w.paths(), P(ML, 'Electricity Bills', 'FY 2026-27', '2026-06 June 2026 Electricity Bill (2).pdf'))
+eq('a revised bill for an account and month already filed counts as a duplicate', w.log().at(-1).Result, 'Duplicate')
+ok('and says why', /same account/.test(w.log().at(-1).Notes), w.log().at(-1).Notes)
+ok('so there is no "(2)" copy', !w.paths().some((p) => / \(2\)\.pdf$/.test(p)), JSON.stringify(w.paths()))
 
 console.log('\n── CHANGING THE PROPERTIES SHEET ──')
 const tab = w.tab('Properties')
@@ -633,8 +664,8 @@ w.thread({
   attachments: [pdf('TPC_Bill_July.pdf', 'The Tata Power Company Ltd\nELECTRICITY BILL\nConsumer No: 900012345678\nBill Month: JUL-2026\nAmount payable 2,700.00')],
 })
 w.run('processBills()')
-has('moving an account number to another property sends its next bill there', w.paths(),
-  P("2, Mother's Love (Malad W)", 'Electricity Bills', 'FY 2026-27', '2026-07 July 2026 Electricity Bill (2).pdf'))
+has('moving an account number to another property sends its next bill there, named by account beside the other meter\'s bill', w.paths(),
+  P("2, Mother's Love (Malad W)", 'Electricity Bills', 'FY 2026-27', '2026-07 July 2026 Electricity Bill - 900012345678.pdf'))
 eq('without making another new property', w.tab('Properties').rows.filter((r) => /^New property/.test(r[0] || '')).length, 0)
 
 console.log('\n── WHEN DRIVE FAILS ──')
@@ -672,7 +703,7 @@ console.log('\n── STAYING INSIDE THE SIX MINUTES ──')
 // run can only get through a few, as on a bad day for Drive.
 const slow = makeWorld()
 Object.assign(slow.costs, { read: 50 * 1000, fetch: 1000, save: 2000 })
-const tataBill = (n, extra = {}) => pdf(`TPC_${n}.pdf`, `The Tata Power Company Ltd\nELECTRICITY BILL\nConsumer No: 900012345678\nBill No ${n}\nBill Month: MAY-2026\nAmount payable ${1000 + n}.00`, extra)
+const tataBill = (n, extra = {}) => pdf(`TPC_${n}.pdf`, `The Tata Power Company Ltd\nELECTRICITY BILL\nConsumer No: ${900012345600 + n}\nBill No ${n}\nBill Month: MAY-2026\nAmount payable ${1000 + n}.00`, extra)
 for (let n = 1; n <= 3; n++) {
   slow.thread({ from: 'Tata Power <bills@tatapower.com>', subject: `Tata Power bill ${n}`, date: '2026-06-03T09:00:00+05:30', body: 'Attached.', attachments: [tataBill(n)] })
 }
@@ -744,6 +775,88 @@ eq('scheduled runs count their minutes', Number(day.store.get(todayKey)), 10.5)
 day.store.set('minutes:2020-01-01', '50')
 day.ctx.processBills({ triggerUid: 'hourly' })
 ok('and old days are forgotten', !day.store.has('minutes:2020-01-01'))
+
+console.log('\n── NO DUPLICATE BILLS ──')
+{
+  const d = makeWorld()
+  const adani = (subject, date, name, text, extra = {}) => d.thread({ from: ADANI, subject, date, body: 'Attached.', attachments: [pdf(name, text, extra)] })
+  adani('Adani Electricity Bill for CA No. 102401902', '2026-05-02T09:00:00+05:30', 'Bill_Apr.pdf',
+    'Adani Electricity\nCA No: 102401902\nBill No: 88001\nBill Month: APR-2026\nAmount payable 1,800.00')
+  // the same bill, regenerated (different bytes), sent again as a reminder and then again in a week
+  adani('Reminder: Adani Electricity Bill for CA No. 102401902', '2026-05-12T09:00:00+05:30', 'Bill_Apr_r.pdf',
+    'Adani Electricity\nCA No: 102401902\nBill No: 88001\nBill Month: APR-2026\nAmount payable 1,800.00\nreprinted')
+  adani('Adani Electricity Bill for CA No. 102401902', '2026-05-05T09:00:00+05:30', 'Bill_Apr_again.pdf',
+    'Adani Electricity\nCA No: 102401902\nBill No: 88001\nBill Month: APR-2026\nAmount payable 1,800.00\ncopy')
+  // May's bill, sent twice two days apart across a month end, unreadable both times, so its month
+  // can only be guessed: the first guess (April) is taken by April's bill, so it moves to May
+  adani('Adani Electricity Bill for CA No. 102401902', '2026-05-31T22:00:00+05:30', 'Scan_1.pdf', '', { unreadable: true })
+  adani('Adani Electricity Bill for CA No. 102401902', '2026-06-02T09:00:00+05:30', 'Scan_2.pdf', 'blurred', { unreadable: true })
+  // a payment receipt for it
+  adani('Payment received for CA No. 102401902', '2026-05-20T09:00:00+05:30', 'Receipt.pdf',
+    'Adani Electricity\nPayment receipt\nCA No: 102401902\nAmount paid 1,800.00')
+  // June's bill: a different bill, kept
+  adani('Adani Electricity Bill for CA No. 102401902', '2026-07-01T09:00:00+05:30', 'Bill_Jun.pdf',
+    'Adani Electricity\nCA No: 102401902\nBill No: 89403\nBill Month: JUN-2026\nAmount payable 1,750.00')
+  // the society: a re-sent maintenance bill is a duplicate, a separate levy the same month is not
+  const society = (subject, name, text) => d.thread({ from: 'Sai Dham CHS <secretary@society.example>', subject, date: '2026-04-03T09:00:00+05:30',
+    body: 'Please find attached.', attachments: [pdf(name, text)] })
+  society('Maintenance bill - Flat B-0202', 'Maint.pdf', 'SAI DHAM CHS\nMaintenance bill\nBill No: 145\nFlat B-0202\nBill for the period Apr-Jun 2026\nTotal 5,300.00')
+  society('Maintenance bill - Flat B-0202 (resent)', 'Maint_resent.pdf', 'SAI DHAM CHS\nMaintenance bill\nBill No: 145\nFlat B-0202\nBill for the period Apr-Jun 2026\nTotal 5,300.00\nresent')
+  society('Repair levy - Flat B-0202', 'Levy.pdf', 'SAI DHAM CHS\nMaintenance bill\nBill No: 152\nFlat B-0202\nBill for the period Apr-Jun 2026\nRepair fund levy\nTotal 2,000.00')
+  d.run('processBills()')
+  const files = d.paths().filter((p) => !p.endsWith('Bill Sorter Settings'))
+  const res = (name) => (d.log().find((r) => r.Attachment === name) || {}).Result
+  eq('the April bill sent three times, as different files, is filed once', files.filter((p) => p.includes('Electricity Bills') && p.includes('2026-04')).length, 1)
+  eq('the reminder is skipped', res('Bill_Apr_r.pdf'), 'Skipped')
+  eq('the copy with the same bill number is a duplicate', res('Bill_Apr_again.pdf'), 'Duplicate')
+  eq('a payment receipt is skipped, not filed as a bill', res('Receipt.pdf'), 'Skipped')
+  ok('and it is never opened', !d.read.includes('Receipt.pdf'))
+  eq('two unreadable copies two days apart, either side of a month end, are filed once', [res('Scan_1.pdf'), res('Scan_2.pdf')].sort().join(', '), 'Duplicate, Filed')
+  has('under May, not as a second April', files, P(ML, 'Electricity Bills', 'FY 2026-27', '2026-05 May 2026 Electricity Bill.pdf'))
+  eq('June\'s bill is its own bill', res('Bill_Jun.pdf'), 'Filed')
+  eq('the re-sent maintenance bill is a duplicate', res('Maint_resent.pdf'), 'Duplicate')
+  eq('the levy with its own bill number is kept', res('Levy.pdf'), 'Filed')
+  has('named by its bill number, not "(2)"', files, P(SD, 'Society Maintenance', 'FY 2026-27', '2026-04 April 2026 Maintenance Bill - No 152.pdf'))
+  ok('so nothing is named "(2)"', !files.some((p) => / \(\d+\)\./.test(p)), JSON.stringify(files))
+  eq('one bill per month for the account', files.filter((p) => p.includes('Electricity Bills')).length, 3)
+
+  // the very same file in an email the log doesn't know about, saved under another name by an
+  // earlier version, is found by Drive search
+  const bytes = 'Adani Electricity\nCA No: 102401902\nBill No: 90010\nBill Month: JUL-2026\nAmount payable 1,700.00'
+  const t1 = adani('Adani Electricity Bill for CA No. 102401902', '2026-08-03T09:00:00+05:30', 'July.pdf', bytes)
+  d.run('processBills()')
+  d.tab('Log').rows.splice(-1, 1) // as if that run had been cut off before writing its log
+  const searchesBefore = d.searches
+  adani('Fwd: Adani Electricity Bill for CA No. 102401902', '2026-10-20T09:00:00+05:30', 'July.pdf', bytes)
+  d.run('processBills()')
+  ok('a file already in Drive but missing from the log is found by searching for its fingerprint', d.searches > searchesBefore)
+  eq('and not saved again', d.paths().filter((p) => p.includes('2026-07') && p.includes('Electricity')).length, 1)
+  ok('t1 is labelled', t1.messages[0].labels.has(d.label))
+}
+
+console.log('\n── STARTING OVER ──')
+{
+  const o = makeWorld()
+  fillMailbox(o)
+  o.run('processBills()')
+  const filedBefore = o.paths().filter((p) => !p.endsWith('Bill Sorter Settings')).length
+  // a duplicate an earlier version left behind, and a file you added yourself
+  const folder = o.folderNamed('FY 2026-27')
+  folder.createFile({ getName: () => '2026-04 April 2026 Electricity Bill (2).pdf', getContentType: () => 'application/pdf', text: 'x' })
+    .setDescription('Filed by Bill Sorter from Gmail message old. sha1=abc')
+  o.folderNamed("2, Mother's Love, (Malad West)").createFile({ getName: () => 'My notes.pdf', getContentType: () => 'application/pdf', text: 'mine' })
+  o.run('startOver()')
+  const left = o.paths()
+  eq('every file the script filed is in the trash', left.filter((p) => !p.endsWith('Bill Sorter Settings') && !p.endsWith('My notes.pdf')).length, 0)
+  has('your own file is left alone', left, P(ML, 'My notes.pdf'))
+  has('the settings spreadsheet stays', left, P('Bill Sorter Settings'))
+  eq('the log is emptied', o.log().length, 0)
+  ok('the old script\'s email keeps its Bill Records label', o.threads.find((t) => t.messages[0].attachments[0].name === 'Old_Bill.pdf').messages[0].labels.has(o.label))
+  ok('the emails it had sorted lose the label', o.pending() > 10, String(o.pending()))
+  o.run('processBills()')
+  eq('the next run sorts them all again, once each', o.paths().filter((p) => !p.endsWith('Bill Sorter Settings') && !p.endsWith('My notes.pdf')).length, filedBefore)
+  ok('with no duplicates', !o.paths().some((p) => / \(\d+\)\./.test(p)))
+}
 
 console.log('\n── SETUP ──')
 const s = makeWorld()

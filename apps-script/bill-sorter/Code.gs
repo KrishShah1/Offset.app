@@ -46,6 +46,12 @@ const CONFIG = {
   DAILY_MINUTES: 80,                     // scheduled runs stop for the day here (Google allows 90)
   MAX_ATTEMPTS: 3,                       // a thread that errors this many runs in a row is labelled anyway
   OCR_LANGUAGE: 'en',
+  // A subject or attachment name with one of these is a payment receipt or a reminder, not a new
+  // bill, so it is skipped instead of being filed next to the bill it is about.
+  NOT_A_BILL: ['payment received', 'payment successful', 'payment confirmation', 'payment confirmed',
+    'thank you for your payment', 'thank you for the payment', 'payment receipt', 'transaction successful',
+    'paid successfully', 'reminder', 'overdue', 'past due', 'disconnection notice', 'final notice'],
+  SAME_BILL_DAYS: 7,                     // two copies of one account's bill this close together are one bill
 };
 
 // Used once, to fill the Properties tab the first time the script runs. After that the
@@ -76,27 +82,33 @@ const STARTING_PROPERTIES = [
 // arrives in April without saying which month it is for) is filed as March's bill.
 // newProperty: an unknown account on this kind of bill starts a new property. Phone, insurance,
 // rent and repair bills don't, since plenty of those (your own mobile, your car) aren't about a property.
+// recurring: one bill per account per period, so a second copy of it is a duplicate. Repair
+// invoices, policies and receipts can legitimately come several to a month.
 const UTILITIES = [
   {
     folder: 'Electricity Bills', label: 'Electricity Bill', short: 'Electricity', inArrears: true, newProperty: true,
+    recurring: true,
     senders: ['adani', 'tatapower', 'bestundertaking', 'mahadiscom', 'mahavitaran', 'torrentpower'],
     keywords: ['electricity', 'adani electricity', 'tata power', 'best undertaking', 'mahavitaran', 'msedcl',
       'torrent power', 'energy charges', 'units consumed', 'kwh', 'meter reading', 'sanctioned load', 'ebill'],
   },
   {
     folder: 'Gas Bills', label: 'Gas Bill', short: 'Gas', inArrears: true, newProperty: true,
+    recurring: true,
     senders: ['mahanagargas'],
     keywords: ['mahanagar gas', 'mgl', 'piped natural gas', 'png bill', 'gas bill', 'gas consumption', 'scm',
       'gas meter', 'adani total gas', 'gujarat gas', 'indraprastha gas'],
   },
   {
     folder: 'Water Bills', label: 'Water Bill', short: 'Water', inArrears: true, newProperty: true,
+    recurring: true,
     senders: [],
     keywords: ['water bill', 'water charges', 'water supply', 'water connection', 'water meter',
       'water consumption', 'sewerage charges', 'hydraulic engineer'],
   },
   {
     folder: 'Internet & Telecom', label: 'Internet & Phone Bill', short: 'Internet', inArrears: true, newProperty: false,
+    recurring: true,
     senders: ['airtel.in', 'airtel.com', 'jio.com', 'mtnl', 'bsnl', 'actcorp', 'hathway', 'tataplay', 'excitel'],
     keywords: ['broadband', 'fibernet', 'jiofiber', 'jio', 'airtel', 'xstream', 'postpaid', 'landline', 'mtnl',
       'bsnl', 'hathway', 'internet bill', 'internet plan', 'internet service', 'data usage', 'wifi',
@@ -104,18 +116,21 @@ const UTILITIES = [
   },
   {
     folder: 'Property Taxes', label: 'Property Tax', short: 'Property Tax', inArrears: false, newProperty: true,
+    recurring: true,
     senders: ['ptax'],
     keywords: ['property tax', 'municipal tax', 'capital value', 'general tax', 'assessment', 'tax bill',
       'education cess', 'tree cess', 'street tax', 'property account'],
   },
   {
     folder: 'Property Insurance', label: 'Insurance', short: 'Insurance', inArrears: false, newProperty: false,
+    recurring: false,
     senders: [],
     keywords: ['insurance', 'policy schedule', 'policy no', 'policy number', 'sum insured', 'premium',
       'home insurance', 'fire insurance', 'insured', 'insurer'],
   },
   {
     folder: 'Lease & Rent Agreements', label: 'Rent', short: 'Rent', inArrears: false, newProperty: false,
+    recurring: false,
     senders: [],
     keywords: ['rent receipt', 'rent agreement', 'rental agreement', 'monthly rent', 'rent for the month',
       'house rent', 'rent paid', 'leave and licence', 'leave and license', 'leave & licence', 'leave & license',
@@ -123,17 +138,20 @@ const UTILITIES = [
   },
   {
     folder: 'Repairs & Maintenance', label: 'Repairs', short: 'Repairs', inArrears: false, newProperty: false,
+    recurring: false,
     senders: [],
     keywords: ['repair work', 'repairs', 'repairing', 'plumbing', 'plumber', 'electrician', 'electrical work',
       'carpentry', 'carpenter', 'painting', 'waterproofing', 'civil work', 'labour charges'],
   },
   {
     folder: 'Pest Control', label: 'Pest Control', short: 'Pest Control', inArrears: false, newProperty: false,
+    recurring: false,
     senders: [],
     keywords: ['pest control', 'pest management', 'termite', 'fumigation', 'cockroach', 'rodent', 'bed bug'],
   },
   {
     folder: 'Society Maintenance', label: 'Maintenance Bill', short: 'Society', inArrears: false, newProperty: true,
+    recurring: true,
     senders: ['mygate', 'nobrokerhood', 'apnacomplex', 'adda.io', 'chsone'],
     keywords: ['maintenance', 'maintenance bill', 'maintenance charges', 'society maintenance', 'housing society',
       'co operative housing', 'chs', 'sinking fund', 'repair fund', 'service charges', 'non occupancy',
@@ -144,7 +162,7 @@ const UTILITIES = [
 // Anything that isn't one of the types above.
 const OTHER = {
   folder: 'Miscellaneous Bills', label: 'Bill', short: 'Other', inArrears: false, newProperty: false,
-  senders: [], keywords: [],
+  recurring: false, senders: [], keywords: [],
 };
 
 // ─── Run these ───────────────────────────────────────────────────────────────
@@ -195,6 +213,81 @@ function processBills(e) {
   } finally {
     if (ownClock) clock_.started = null;
   }
+}
+
+/**
+ * Run by hand once to clear out duplicates left by earlier versions. Moves every bill this
+ * script filed to the Drive trash (restorable there for 30 days), empties the Log tab and takes
+ * the Bill Records label off the emails it handled, so the next runs sort them all again, once.
+ * Emails the old script labelled, and files you put in the folders yourself, are left alone.
+ * If it runs out of time it says so: run it again to finish.
+ */
+function startOver() {
+  const ownClock = startClock_();
+  try {
+    const ctx = openContext_();
+    if (trashFiled_(ctx.base, ctx.settings.getId(), 0)) {
+      console.log('Not finished yet: run startOver again.');
+      return;
+    }
+    const rows = ctx.logSheet.getLastRow() - 1;
+    let unlabelled = 0;
+    if (rows > 0) {
+      const ids = {};
+      ctx.logSheet.getRange(2, LOG_HEADERS.indexOf('Email') + 1, rows, 1).getValues().forEach((r) => {
+        const m = /\/([^\/#?]+)\s*$/.exec(String(r[0]));
+        if (m) ids[m[1]] = true;
+      });
+      const threads = Object.keys(ids).map(threadById_).filter(Boolean);
+      for (let i = 0; i < threads.length; i += 100) ctx.label.removeFromThreads(threads.slice(i, i + 100));
+      unlabelled = threads.length;
+      ctx.logSheet.deleteRows(2, rows);
+    }
+    const props = PropertiesService.getScriptProperties();
+    props.getKeys().forEach((k) => {
+      if (k.indexOf('attempts:') === 0) props.deleteProperty(k);
+    });
+    console.log('Cleared. ' + unlabelled + ' emails will be sorted again, starting with the next run ' +
+      '(or run processBills now).');
+  } finally {
+    if (ownClock) clock_.started = null;
+  }
+}
+
+function threadById_(id) {
+  try {
+    return GmailApp.getThreadById(id);
+  } catch (e) {
+    return null;
+  }
+}
+
+// Trashes every file this script filed under the folder, then the utility and year folders left
+// empty; property folders and the settings spreadsheet stay. True if it ran out of time.
+function trashFiled_(folder, keepId, depth) {
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    if (past_(CONFIG.RUN_MINUTES)) return true;
+    const file = files.next();
+    if (file.getId() === keepId || file.isTrashed()) continue;
+    if (String(file.getDescription() || '').indexOf('Filed by Bill Sorter') === 0) file.setTrashed(true);
+  }
+  const folders = folder.getFolders();
+  while (folders.hasNext()) {
+    const sub = folders.next();
+    if (sub.isTrashed()) continue;
+    if (trashFiled_(sub, keepId, depth + 1)) return true;
+    if (depth >= 1 && isEmpty_(sub)) sub.setTrashed(true);
+  }
+  return false;
+}
+
+function isEmpty_(folder) {
+  const files = folder.getFiles();
+  while (files.hasNext()) if (!files.next().isTrashed()) return false;
+  const folders = folder.getFolders();
+  while (folders.hasNext()) if (!folders.next().isTrashed()) return false;
+  return true;
 }
 
 /** The old script's name, so a trigger that was set up for it keeps working. */
@@ -416,22 +509,44 @@ function handleAttachment_(message, item, ctx) {
     fy: v.fy,
     month: MONTHS[v.month.m] + ' ' + v.month.y + ' (' + v.month.how + ')',
     notes: [v.notes, note].filter(Boolean).join(' '),
+    account: v.accountId,
+    billNo: v.billNo,
   };
   if (v.action === 'skip') return Object.assign(outcome, { result: 'Skipped' });
+
+  const same = sameBill_(ctx, v, message.getDate());
+  if (same) {
+    return Object.assign(outcome, {
+      result: 'Duplicate',
+      property: same.property,
+      url: same.url,
+      notes: [outcome.notes, 'The same bill as one already filed (' + same.why + ').'].filter(Boolean).join(' '),
+    });
+  }
+
+  placeGuess_(ctx, v, message.getDate());
+  if (v.moved) outcome.month = MONTHS[v.month.m] + ' ' + v.month.y + ' (' + v.month.how + ', moved past another bill)';
+  outcome.fy = v.fy;
 
   let property = null;
   if (v.action === 'file') property = v.match.property;
   if (v.action === 'new') property = addProperty_(ctx, v.utility, v.account, message.getSubject());
   const top = property ? property.folder : subfolder_(ctx, ctx.base, CONFIG.NEEDS_REVIEW);
   const target = subfolder_(ctx, subfolder_(ctx, top, v.utility.folder), v.fy);
-  const saved = saveFile_(ctx, target, blob, v.fileBase + extension_(item), item.hash, message.getId());
+  // Two different bills that want the same name (two meters, a levy beside the maintenance bill)
+  // are told apart by account or bill number, not "(2)".
+  const tag = v.utility.recurring && v.accountId ? v.accountId : v.billNo ? 'No ' + v.billNo.toUpperCase() : '';
+  const altBase = tag ? v.fileBase + ' - ' + tag : '';
+  const saved = saveFile_(ctx, target, blob, v.fileBase, extension_(item), item.hash, message.getId(), altBase);
+  const propertyName = property ? property.name : CONFIG.NEEDS_REVIEW;
+  if (!saved.duplicate) rememberBill_(ctx, v, propertyName, message.getDate(), saved.url);
   let result = 'Filed';
   if (v.action === 'new') result = 'Filed (new property)';
   if (v.action === 'review') result = 'Needs review';
   if (saved.duplicate) result = 'Duplicate';
   return Object.assign(outcome, {
     result: result,
-    property: property ? property.name : CONFIG.NEEDS_REVIEW,
+    property: propertyName,
     matchedBy: v.action === 'new' ? 'new account ' + v.account : v.action === 'file' ? v.match.why : '',
     url: saved.url,
   });
@@ -439,11 +554,14 @@ function handleAttachment_(message, item, ctx) {
 
 // Whether to open the attachment. Not when the email already names one of your account numbers
 // (unless the email carries several attachments and only opening them shows which is the bill),
-// and not when nothing about the email suggests a property bill at all.
+// and not when nothing about the email suggests a property bill at all, or it is a receipt.
 function wantsReading_(v, t, item, ctx) {
+  if (v.notABill) return false;
   if (CONFIG.READ_ATTACHMENTS === 'always') return true;
   const settled = v.action === 'file' && v.match.score >= 50 && v.utility !== OTHER;
-  if (settled && item.count === 1) return false;
+  // A recurring bill whose email doesn't say the month is opened anyway: guessing the month from
+  // when the email arrived is how one month's bill ends up looking like a copy of another's.
+  if (settled && item.count === 1 && !(v.utility.recurring && isGuess_(v.month))) return false;
   const fromMe = Boolean(ctx.me) && t.from.indexOf(ctx.me) !== -1;
   return settled || fromMe || v.utilityScore >= 2 || Boolean(v.match.property || v.match.ambiguous) ||
     /(?:^|[^a-z])(?:e-?)?bills?(?![a-z])/.test(t.subject + ' ' + t.file);
@@ -539,8 +657,12 @@ function classify_(t, properties, arrived) {
   const v = {
     utility: utility, utilityScore: found.score, month: month, fy: financialYear_(month),
     fileBase: fileBase_(month, utility), match: match, account: '', action: '', notes: '',
+    billNo: extractBillNo_(t), accountId: '', notABill: notABill_(t),
   };
-  if (t.doc.length >= 40 && !BILL_WORDS.test(t.doc)) {
+  if (v.notABill) {
+    v.action = 'skip';
+    v.notes = 'A payment receipt or reminder, not a new bill.';
+  } else if (t.doc.length >= 40 && !BILL_WORDS.test(t.doc)) {
     v.action = 'skip';
     v.notes = 'No bill wording in the attachment.';
   } else if (match.ambiguous) {
@@ -564,7 +686,30 @@ function classify_(t, properties, arrived) {
     v.action = v.account ? 'new' : 'review';
     if (!v.account) v.notes = 'No known property and no account number found.';
   }
+  // The account this bill belongs to, used to recognise a second copy of it.
+  v.accountId = (match.property && match.accounts[0]) || v.account;
   return v;
+}
+
+function notABill_(t) {
+  if (!notABill_.patterns) notABill_.patterns = CONFIG.NOT_A_BILL.map(phraseRegex_).filter(Boolean);
+  return notABill_.patterns.some((re) => re.test(t.subject) || re.test(t.file));
+}
+
+const BILL_NO_RE = /(?:^|[^a-z])(?:bill|invoice)\s*(?:no\b|number\b|num\b|#)\.?\s*[:#.-]?\s*([a-z0-9][a-z0-9\/-]{0,30})/g;
+
+// The bill's own number ("Bill No: 145"), which a re-sent copy of the same bill shares.
+function extractBillNo_(t) {
+  const texts = [t.doc, t.subject, t.file];
+  for (let i = 0; i < texts.length; i++) {
+    BILL_NO_RE.lastIndex = 0;
+    let m;
+    while ((m = BILL_NO_RE.exec(texts[i]))) {
+      const token = m[1].replace(/[\/-]+$/, '');
+      if (token.length >= 2 && /\d/.test(token) && !/^\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}$/.test(token)) return token;
+    }
+  }
+  return '';
 }
 
 function detectUtility_(t) {
@@ -595,12 +740,14 @@ function matchProperty_(t, properties) {
   properties.forEach((p) => {
     let score = 0;
     const why = [];
+    const found = [];
     p.accounts.forEach((account) => {
       const re = numberRegex_(account);
       const w = re.test(t.doc) || re.test(t.file) ? 100 : re.test(t.subject) ? 80 : re.test(t.body) ? 50 : 0;
       if (w) {
         score += w;
         why.push('account ' + account);
+        found.push({ account: account, w: w });
       }
     });
     const seen = {};
@@ -615,12 +762,13 @@ function matchProperty_(t, properties) {
         why.push('"' + keyword + '"');
       }
     });
-    if (score) scored.push({ property: p, score: score, why: why.join(', ') });
+    const accounts = found.sort((a, b) => b.w - a.w).map((x) => x.account);
+    if (score) scored.push({ property: p, score: score, why: why.join(', '), accounts: accounts });
   });
   scored.sort((a, b) => b.score - a.score);
-  if (!scored.length) return { property: null, score: 0 };
+  if (!scored.length) return { property: null, score: 0, accounts: [] };
   if (scored.length > 1 && scored[1].score === scored[0].score) {
-    return { property: null, score: 0, ambiguous: [scored[0].property.name, scored[1].property.name] };
+    return { property: null, score: 0, accounts: [], ambiguous: [scored[0].property.name, scored[1].property.name] };
   }
   return scored[0];
 }
@@ -899,7 +1047,7 @@ const PROPERTY_HELP = [
   '',
 ];
 const LOG_HEADERS = ['Processed', 'Email date', 'From', 'Subject', 'Attachment', 'Result', 'Property', 'Utility',
-  'Financial year', 'Bill month', 'Matched by', 'Drive file', 'Email', 'Notes', 'Key'];
+  'Financial year', 'Bill month', 'Matched by', 'Drive file', 'Email', 'Notes', 'Key', 'Account', 'Bill no'];
 
 function openContext_() {
   if (typeof Drive === 'undefined') {
@@ -986,10 +1134,17 @@ function propertiesTab_(ss) {
 
 function logTab_(ss) {
   let sheet = ss.getSheetByName('Log');
-  if (sheet) return sheet;
-  sheet = ss.insertSheet('Log');
-  sheet.getRange(1, 1, 1, LOG_HEADERS.length).setValues([LOG_HEADERS]).setFontWeight('bold');
-  sheet.setFrozenRows(1);
+  if (!sheet) {
+    sheet = ss.insertSheet('Log');
+    sheet.setFrozenRows(1);
+  }
+  // A log made by an earlier version gets the columns added since.
+  const header = sheet.getRange(1, 1, 1, LOG_HEADERS.length);
+  if (header.getValues()[0].join('|') !== LOG_HEADERS.join('|')) {
+    header.setValues([LOG_HEADERS]).setFontWeight('bold');
+    const letter = (name) => String.fromCharCode(65 + LOG_HEADERS.indexOf(name));
+    sheet.getRange(letter('Account') + ':' + letter('Bill no')).setNumberFormat('@');
+  }
   return sheet;
 }
 
@@ -1087,30 +1242,33 @@ function childFolder_(parent, name) {
   return found.hasNext() ? found.next() : parent.createFolder(name);
 }
 
-// Saves the bill unless the same file has been filed before. The log says which files those
-// are, so this usually costs no Drive calls at all; a file saved by a run that stopped before
-// writing its log is recognised by its name and the fingerprint in its description. A different
-// bill with the same name gets " (2)", " (3)" and so on.
-function saveFile_(ctx, folder, blob, name, hash, messageId) {
+// Saves the bill unless the very same file has been filed before, anywhere under the bills
+// folder: the log knows most of them, Drive's search finds the rest by the fingerprint in their
+// description, and a file a cut-off run saved moments ago is found by its name. A different bill
+// that wants a taken name gets altBase (the name with its account number) or " (2)", " (3)".
+function saveFile_(ctx, folder, blob, base, ext, hash, messageId, altBase) {
   if (ctx.filed[hash]) return { url: ctx.filed[hash], duplicate: true };
-  const dot = name.lastIndexOf('.');
-  let finalName = name;
-  for (let n = 2; ; n++) {
+  const elsewhere = filedCopy_(hash);
+  if (elsewhere) return sameFile_(ctx, elsewhere, hash, messageId);
+  const nameAt = (i) => {
+    if (i === 0) return base + ext;
+    if (altBase) return (i === 1 ? altBase : altBase + ' (' + i + ')') + ext;
+    return base + ' (' + (i + 1) + ')' + ext;
+  };
+  let finalName = nameAt(0);
+  for (let i = 1; ; i++) {
     const sameName = folder.getFilesByName(finalName);
     let taken = false;
     while (sameName.hasNext()) {
       const file = sameName.next();
       if (file.isTrashed()) continue;
       taken = true;
-      const description = String(file.getDescription() || '');
-      if (description.indexOf('sha1=' + hash) !== -1) {
-        ctx.filed[hash] = file.getUrl();
-        // Saved for this same email by a run that ran out of time: that's this filing, not a copy.
-        return { url: ctx.filed[hash], duplicate: description.indexOf(messageId) === -1 };
+      if (String(file.getDescription() || '').indexOf('sha1=' + hash) !== -1) {
+        return sameFile_(ctx, file, hash, messageId);
       }
     }
     if (!taken) break;
-    finalName = name.slice(0, dot) + ' (' + n + ')' + name.slice(dot);
+    finalName = nameAt(i);
   }
   const file = folder.createFile(blob.setName(finalName));
   file.setDescription('Filed by Bill Sorter from Gmail message ' + messageId + '. sha1=' + hash);
@@ -1118,16 +1276,101 @@ function saveFile_(ctx, folder, blob, name, hash, messageId) {
   return { url: ctx.filed[hash], duplicate: false };
 }
 
+// An existing copy of the file. If it was saved for this same email by a run that ran out of
+// time, that is this filing, not a duplicate.
+function sameFile_(ctx, file, hash, messageId) {
+  ctx.filed[hash] = file.getUrl();
+  return { url: ctx.filed[hash], duplicate: String(file.getDescription() || '').indexOf(messageId) === -1 };
+}
+
+function filedCopy_(hash) {
+  try {
+    const found = DriveApp.searchFiles("fullText contains '" + hash + "' and trashed = false");
+    while (found.hasNext()) {
+      const file = found.next();
+      if (String(file.getDescription() || '').indexOf('sha1=' + hash) !== -1) return file;
+    }
+  } catch (e) {
+    console.log("Couldn't search Drive for an earlier copy: " + (e && e.message ? e.message : e));
+  }
+  return null;
+}
+
+// Whether this bill was already filed from another email, even as a different file: the same
+// bill number; or, for a bill tied to an account, a copy that arrived within SAME_BILL_DAYS of it
+// or one for the same month (when both months come from the bills, not from arrival dates).
+// Recurring bills only: repair invoices and the like can come several to a month.
+function sameBill_(ctx, v, arrived) {
+  const who = billOwner_(v);
+  if (!who || !v.utility.recurring) return null;
+  const mine = ctx.bills.filter((b) => b.who === who && b.utility === v.utility.folder);
+  const t = arrived.getTime();
+  const day = 24 * 60 * 60 * 1000;
+  let hit = v.billNo && mine.filter((b) => b.billNo === v.billNo && Math.abs(b.arrived - t) <= 180 * day)[0];
+  if (hit) return { url: hit.url, property: hit.property, why: 'bill no. ' + v.billNo };
+  if (who.indexOf('a:') !== 0) return null;
+  hit = mine.filter((b) => Math.abs(b.arrived - t) <= CONFIG.SAME_BILL_DAYS * day)[0];
+  if (hit) return { url: hit.url, property: hit.property, why: 'same account, arrived within ' + CONFIG.SAME_BILL_DAYS + ' days' };
+  if (!isGuess_(v.month)) {
+    hit = mine.filter((b) => !b.guess && b.ym === ymKey_(v.month))[0];
+    if (hit) return { url: hit.url, property: hit.property, why: 'same account and month' };
+  }
+  return null;
+}
+
+// A month guessed from the arrival date can land on a month whose bill (from the same account,
+// arriving well apart) is already filed; then this bill is that month's neighbour.
+function placeGuess_(ctx, v, arrived) {
+  const who = billOwner_(v);
+  if (who.indexOf('a:') !== 0 || !v.utility.recurring || !isGuess_(v.month)) return;
+  const mine = ctx.bills.filter((b) => b.who === who && b.utility === v.utility.folder);
+  const t = arrived.getTime();
+  for (let step = 0; step < 3; step++) {
+    const taken = mine.filter((b) => b.ym === ymKey_(v.month))[0];
+    if (!taken) break;
+    const next = addMonths_(v.month, t > taken.arrived ? 1 : -1);
+    v.month = { y: next.y, m: next.m, how: v.month.how };
+    v.moved = true;
+  }
+  v.fy = financialYear_(v.month);
+  v.fileBase = fileBase_(v.month, v.utility);
+}
+
+function billOwner_(v) {
+  if (v.accountId) return 'a:' + v.accountId;
+  if (v.action === 'file') return 'p:' + v.match.property.name;
+  return '';
+}
+
+function rememberBill_(ctx, v, property, arrived, url) {
+  const who = billOwner_(v);
+  if (!who || !v.utility.recurring) return;
+  ctx.bills.push({
+    who: who, utility: v.utility.folder, billNo: v.billNo, ym: ymKey_(v.month), guess: isGuess_(v.month),
+    arrived: arrived.getTime(), property: property, url: url,
+  });
+}
+
+const GUESSED_MONTHS = ['month before the email arrived', 'month the email arrived'];
+
+function isGuess_(month) {
+  return GUESSED_MONTHS.indexOf(month.how) !== -1;
+}
+
+function ymKey_(month) {
+  return month.y + '-' + month.m;
+}
+
 // What earlier runs did, from the Log tab: the attachments handled (never looked at again), the
-// emails finished with (their attachments aren't even downloaded again), and the files filed.
+// emails finished with (their attachments aren't even downloaded again), the files filed, and the
+// bills filed (to recognise another copy of one).
 function loadMemory_(logSheet) {
-  const memory = { done: new Set(), doneMessages: new Set(), filed: {} };
+  const memory = { done: new Set(), doneMessages: new Set(), filed: {}, bills: [] };
   const last = logSheet.getLastRow();
   if (last < 2) return memory;
-  const first = LOG_HEADERS.indexOf('Result');
-  const col = (name) => LOG_HEADERS.indexOf(name) - first;
+  const col = (name) => LOG_HEADERS.indexOf(name);
   const failed = {};
-  logSheet.getRange(2, first + 1, last - 1, LOG_HEADERS.length - first).getValues().forEach((row) => {
+  logSheet.getRange(2, 1, last - 1, LOG_HEADERS.length).getValues().forEach((row) => {
     const parts = String(row[col('Key')] || '').split(':'); // message id : file fingerprint [: error]
     if (parts.length < 2) return;
     if (parts[2] === 'error') {
@@ -1136,18 +1379,40 @@ function loadMemory_(logSheet) {
     }
     memory.done.add(parts[0] + ':' + parts[1]);
     memory.doneMessages.add(parts[0]);
+    const result = String(row[col('Result')]);
     const url = String(row[col('Drive file')] || '');
-    if (url && row[col('Result')] !== 'Skipped') memory.filed[parts[1]] = url;
+    if (url && result !== 'Skipped') memory.filed[parts[1]] = url;
+    if (result === 'Filed' || result === 'Filed (new property)') {
+      const bill = loggedBill_(row, col, url);
+      if (bill) memory.bills.push(bill);
+    }
   });
   Object.keys(failed).forEach((id) => memory.doneMessages.delete(id));
   return memory;
+}
+
+// A filed bill, as remembered from its log row (rows from earlier versions included).
+function loggedBill_(row, col, url) {
+  const utility = UTILITIES.filter((u) => u.folder === String(row[col('Utility')]))[0];
+  const month = /^([A-Za-z]+) (\d{4}) \((.+)\)$/.exec(String(row[col('Bill month')] || ''));
+  if (!utility || !utility.recurring || !month || MONTHS.indexOf(month[1]) === -1) return null;
+  const matched = /account (\d{6,16})/.exec(String(row[col('Matched by')] || ''));
+  const account = String(row[col('Account')] || '') || (matched ? matched[1] : '');
+  const property = String(row[col('Property')] || '');
+  const who = account ? 'a:' + account : property && property !== CONFIG.NEEDS_REVIEW ? 'p:' + property : '';
+  if (!who) return null;
+  const ym = { y: Number(month[2]), m: MONTHS.indexOf(month[1]), how: month[3] };
+  return {
+    who: who, utility: utility.folder, billNo: String(row[col('Bill no')] || ''), ym: ymKey_(ym),
+    guess: isGuess_(ym), arrived: new Date(row[col('Email date')]).getTime(), property: property, url: url,
+  };
 }
 
 function logValues_(thread, message, item, o, key) {
   return [
     new Date(), message.getDate(), cell_(message.getFrom()), cell_(message.getSubject()), cell_(item.name),
     o.result, cell_(o.property || ''), o.utility || '', o.fy || '', o.month || '', cell_(o.matchedBy || ''),
-    o.url || '', thread.getPermalink(), cell_(o.notes || ''), key,
+    o.url || '', thread.getPermalink(), cell_(o.notes || ''), key, o.account || '', cell_(o.billNo || ''),
   ];
 }
 
