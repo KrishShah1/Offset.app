@@ -76,7 +76,7 @@ financial year it chose and why, and what it matched on. The results:
 | Filed (new property) | Started a new property row and folder |
 | Needs review | In `_Needs Review`: no known account or keyword, or two properties matched equally |
 | Duplicate | Already filed: the same file, or the same bill sent again (same bill number, or same account and month) |
-| Skipped | Not a property bill: see below |
+| Skipped | Not a property bill: see below. Run **retrySkipped** to have these looked at again |
 | Error | Something failed; it tries again next run, up to three times |
 
 **_Needs Review.** Move the file by hand, then add the account number or a keyword to the right
@@ -89,16 +89,26 @@ Only property bills. An attachment is filed when all of these hold:
 - it is one of the bill types in `UTILITIES` (electricity, gas, water, internet and phone, property
   tax, home or fire insurance, rent, repairs, pest control, society maintenance). Nothing else is
   filed; there is no "miscellaneous" folder;
-- it reads like a bill: an amount, and a due date, bill number, bill date or billing period;
-- it isn't a receipt, reminder or notice (`NOT_A_BILL`: payment confirmations, outage notices,
-  newsletters, tariff sheets, AGM notices, circulars, offers);
-- it belongs to one of your properties. Your property keywords are your address, which is on
-  everything sent to you, so a match on address alone also needs clear signs of the bill type;
-  and phone and internet bills are filed only when their account number is in the sheet, so your
-  own mobile bill stays out.
+- it reads like a bill: an amount, and a due date, bill number, bill date or billing period, or a
+  heading such as "Maintenance Bill" or "Tax Invoice". If the attachment can't be read, an email
+  that calls it a bill will do;
+- it isn't a payment receipt (`PAYMENTS` in `CONFIG`) or a reminder or notice (`NOTICES`: outage
+  notices, newsletters, tariff sheets, AGM notices, circulars, offers). A reminder whose subject also
+  says bill ("Reminder: maintenance bill for May") is still looked at, and so is a bill sent with an
+  AGM notice: the bill is filed, the notice isn't;
+- it isn't a bank or card statement, an online order or a car service bill (`NOT_PROPERTY`), even
+  with your address on it;
+- it belongs to one of your properties: one of its account numbers, or its address (the keywords).
+  Your address is on everything sent to you, so a bill matched by address alone needs the bill
+  wording above, not just an amount. A mobile phone bill is filed only when its number is in the
+  sheet, so your own mobile stays out; broadband and landline bills go by address like the rest.
 
-So bank and card statements, car and health insurance, shopping invoices, promotions and society
-circulars are skipped and logged with the reason, not filed.
+Every attachment it skips is in the Log tab with the reason in the Notes column.
+
+**If a bill was skipped that shouldn't have been,** fix the reason (usually: add its account
+number or a keyword to the property's row), then choose **retrySkipped** in the function list and
+click **Run**. It takes every Skipped row out of the Log and the `Bill Records` label off those
+emails, and the next run looks at them again. Bills already filed are left alone.
 
 ## Duplicates
 
@@ -110,7 +120,7 @@ filed, and not saved, when it is:
 - for a bill with an account number (electricity, gas, water, internet, property tax, society):
   another one that arrived within 7 days of it, or one for the same account and month.
 
-Payment receipts and reminders (`NOT_A_BILL` in `CONFIG`) are skipped. Two genuinely different
+A reminder that carries the bill again is recognised as the same bill. Two genuinely different
 bills that land on the same name, like two meters at one property, are named by account or bill
 number (`… Electricity Bill - 102401902.pdf`) rather than `(2)`.
 

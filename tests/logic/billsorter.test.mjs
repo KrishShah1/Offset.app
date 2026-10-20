@@ -170,9 +170,11 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
 
   // ── Sheets ──
   const books = new Map()
+  // Like Sheets: a new tab has 1000 rows, and a range past the last one is an error.
   const makeSheet = (name) => {
-    const s = { name, rows: [], notes: {} }
+    const s = { name, rows: [], notes: {}, maxRows: 1000 }
     const range = (r, c, nr = 1, nc = 1) => {
+      if (r - 1 + nr > s.maxRows) throw new Error('The coordinates of the range are outside the dimensions of the sheet.')
       const rg = {
         getValues: () => Array.from({ length: nr }, (_, i) =>
           Array.from({ length: nc }, (_, j) => (s.rows[r - 1 + i] || [])[c - 1 + j] ?? '')),
@@ -184,6 +186,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
           return rg
         },
         setValue: (v) => rg.setValues([[v]]),
+        clearContent: () => rg.setValues(Array.from({ length: nr }, () => Array(nc).fill(''))),
         setFontWeight: () => rg, setNumberFormat: () => rg,
         setNote: (note) => { s.notes[`${r},${c}`] = note; return rg },
       }
@@ -191,8 +194,15 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
     }
     return Object.assign(s, {
       getName: () => s.name, setName: (v) => { s.name = v; return s },
-      getLastRow: () => s.rows.length,
-      appendRow: (row) => { s.rows.push([...row]); return s },
+      // the last row with anything in it
+      getLastRow: () => {
+        let n = s.rows.length
+        while (n && (s.rows[n - 1] || []).every((v) => v === '' || v == null)) n--
+        return n
+      },
+      getMaxRows: () => s.maxRows,
+      insertRowsAfter: (after, n) => { s.maxRows += n; return s },
+      appendRow: (row) => { s.rows.splice(s.getLastRow(), 0, [...row]); s.maxRows = Math.max(s.maxRows, s.rows.length); return s },
       deleteRows: (at, n) => { s.rows.splice(at - 1, n); return s },
       getRange: (a, b, c, d) => (typeof a === 'string' ? range(1, 1) : range(a, b, c, d)),
       getDataRange: () => range(1, 1, Math.max(1, s.rows.length), Math.max(1, ...s.rows.map((x) => x.length))),
@@ -226,6 +236,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
     getScriptProperties: () => ({
       getProperty: (k) => (store.has(k) ? store.get(k) : null),
       setProperty: (k, v) => { store.set(k, String(v)) },
+      setProperties: (o) => { Object.entries(o).forEach(([k, v]) => store.set(k, String(v))) },
       deleteProperty: (k) => { store.delete(k) },
       getKeys: () => [...store.keys()],
     }),
@@ -285,7 +296,8 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
     tab: (name) => [...books.values()][0].getSheetByName(name),
     log: () => {
       const headers = vm.runInContext('LOG_HEADERS', ctx)
-      return w.tab('Log').rows.slice(1).map((r) => Object.fromEntries(headers.map((h, i) => [h, r[i]])))
+      return w.tab('Log').rows.slice(1).filter((r) => r.some((v) => v !== '' && v != null))
+        .map((r) => Object.fromEntries(headers.map((h, i) => [h, r[i]])))
     },
     leftoverOcrDocs: () => [...items.values()].filter((x) => !x.deleted && /^Bill Sorter OCR/.test(x.name)).length,
     pending: () => threads.filter((t) => t.messages.some((m) => !m.labels.has(w.label))).length,
@@ -807,7 +819,7 @@ console.log('\n── NO DUPLICATE BILLS ──')
   const files = d.paths().filter((p) => !p.endsWith('Bill Sorter Settings'))
   const res = (name) => (d.log().find((r) => r.Attachment === name) || {}).Result
   eq('the April bill sent three times, as different files, is filed once', files.filter((p) => p.includes('Electricity Bills') && p.includes('2026-04')).length, 1)
-  eq('the reminder is skipped', res('Bill_Apr_r.pdf'), 'Skipped')
+  eq('the reminder carrying it is recognised as the same bill', res('Bill_Apr_r.pdf'), 'Duplicate')
   eq('the copy with the same bill number is a duplicate', res('Bill_Apr_again.pdf'), 'Duplicate')
   eq('a payment receipt is skipped, not filed as a bill', res('Receipt.pdf'), 'Skipped')
   ok('and it is never opened', !d.read.includes('Receipt.pdf'))
@@ -885,6 +897,93 @@ console.log('\n── NOTHING BUT BILLS ──')
     attachments: [pdf('Home_Policy.pdf', `Home insurance policy schedule\n${HOME}\nPremium Rs 4,000\nPolicy period 01-06-2026 to 31-05-2027`)] })
   home.run('processBills()')
   has('a home insurance policy for a property is filed', home.paths(), P(ML, 'Property Insurance', 'FY 2026-27', '2026-06 June 2026 Insurance.pdf'))
+}
+
+console.log('\n── REAL BILLS STILL GET THROUGH ──')
+{
+  const r = makeWorld()
+  const HOME = "2, Mother's Love, Pankaj CHS, Evershine Ngr, Malad West"
+  const CHS = 'Pankaj CHS <pankajchs@example.com>'
+  const mail = (from, subject, date, attachments, body = 'Please find attached.') => r.thread({ from, subject, date, body, attachments })
+  // a hand-made society bill: no due date, bill number or period, just a heading and a total
+  mail(CHS, 'Maintenance bill for May 2026', '2026-05-02T09:00:00+05:30', [pdf('May.pdf',
+    `PANKAJ CO-OP HOUSING SOCIETY LTD\nMAINTENANCE BILL\nMember: ${HOME}\nMonth: May 2026\nMaintenance 2,500.00\nSinking fund 300.00\nTotal 2,800.00`)])
+  // a bill sent as a reminder, with no earlier copy
+  mail(CHS, 'Reminder: maintenance bill for June 2026', '2026-06-12T09:00:00+05:30', [pdf('June.pdf',
+    `PANKAJ CO-OP HOUSING SOCIETY LTD\nMAINTENANCE BILL\nMember: ${HOME}\nMonth: June 2026\nMaintenance 2,500.00\nTotal 2,500.00\nPay before 15-06-2026`)])
+  // the bill and the AGM notice in one email
+  mail(CHS, 'Maintenance bill and AGM notice', '2026-07-02T09:00:00+05:30', [
+    pdf('Bill_July.pdf', `PANKAJ CO-OP HOUSING SOCIETY LTD\nMAINTENANCE BILL\nMember: ${HOME}\nMonth: July 2026\nMaintenance 2,500.00\nTotal 2,500.00`),
+    pdf('AGM_Notice.pdf', `PANKAJ CHS\nNotice: the annual general meeting is on 20-07-2026 in the society office.`)])
+  // a broadband bill whose account number isn't in the sheet
+  mail('Airtel <ebill@airtel.in>', 'Your Airtel Xstream Fiber bill', '2026-06-06T09:00:00+05:30', [pdf('Fiber.pdf',
+    `Airtel Xstream Fiber\n${HOME}\nAccount No 20345678\nBill date 05-06-2026\nAmount payable Rs 1,179.00`)])
+  // a home insurance policy that only says "householder's"
+  mail('Insurer <policy@insurer.example>', 'Your policy document', '2026-07-01T09:00:00+05:30', [pdf('Policy.pdf',
+    `Householder's package policy\n${HOME}\nPolicy No 1234/5678\nPremium Rs 3,200\nPeriod of insurance 01-07-2026 to 30-06-2027`)],
+    `Your policy for ${HOME} is attached.`)
+  // an Adani bill whose PDF can't be read, in an email that doesn't say "bill"
+  mail(ADANI, 'Adani Electricity: CA No. 102401902 - August 2026', '2026-09-03T09:00:00+05:30',
+    [pdf('102401902_AUG.pdf', '', { unreadable: true })])
+  // an Adani bill whose PDF reads badly: an amount, and the email says it is the bill
+  mail(ADANI, 'Adani Electricity Bill for CA No. 151759775', '2026-06-04T09:00:00+05:30', [pdf('Garbled.pdf',
+    'Adani Electricity Mumbai Ltd  CA 151759775  Bil1 Mnth MAY 2026  Net 1,950.00 total  Dve Dt 20 06 2026')])
+  // and what must still stay out
+  mail(ADANI, 'Security deposit for CA No. 102401902', '2026-06-11T09:00:00+05:30', [pdf('Deposit.pdf',
+    'Adani Electricity\nCA No: 102401902\nYour security deposit has been revised. An additional amount of Rs 1,200 will be added to your next bill.')])
+  mail('Airtel <ebill@airtel.in>', 'Your Airtel bill', '2026-06-07T09:00:00+05:30', [pdf('Mobile.pdf',
+    `Airtel postpaid\n${HOME}\nBill date 05-06-2026\nAmount payable Rs 599.00\nUpgrade to Airtel Xstream Fiber today`)])
+  mail('HDFC Bank <cards@hdfcbank.example>', 'Your credit card statement', '2026-06-08T09:00:00+05:30', [pdf('Card.pdf',
+    `Credit card statement\n${HOME}\nStatement date 01-06-2026\nADANI ELECTRICITY MUMBAI 1,950.00\nMinimum amount due Rs 500\nTotal amount due Rs 18,250.00`)],
+    `Statement for ${HOME}`)
+  mail('Auto Care <service@autocare.example>', 'Invoice for your car service', '2026-06-09T09:00:00+05:30', [pdf('Service.pdf',
+    `Tax Invoice\nInvoice No 5521\n${HOME}\nChassis No MA3EJKD1S00\nPeriodic maintenance service\nLabour charges 1,200.00\nTotal 4,500.00`)])
+  mail('Amazon.in <auto-confirm@amazon.in>', 'Your Amazon.in order', '2026-06-10T09:00:00+05:30', [pdf('Order.pdf',
+    `Tax Invoice\nSold by XYZ Retail\nPlumbing tape 2 pcs\nShip to: ${HOME}\nInvoice date 10-06-2026\nTotal 299.00`)])
+  r.run('processBills()')
+  const filed = r.paths()
+  const why = (name) => { const x = r.log().find((row) => row.Attachment === name) || {}; return `${x.Result}: ${x.Notes}` }
+  has('a society bill with only a heading and a total is filed', filed, P(ML, 'Society Maintenance', 'FY 2026-27', '2026-05 May 2026 Maintenance Bill.pdf'))
+  has('a bill sent as a reminder is filed', filed, P(ML, 'Society Maintenance', 'FY 2026-27', '2026-06 June 2026 Maintenance Bill.pdf'))
+  has('the bill beside an AGM notice is filed', filed, P(ML, 'Society Maintenance', 'FY 2026-27', '2026-07 July 2026 Maintenance Bill.pdf'))
+  ok('and the notice is not', /Skipped: A reminder or notice/.test(why('AGM_Notice.pdf')), why('AGM_Notice.pdf'))
+  has('a broadband bill goes by address', filed, P(ML, 'Internet & Telecom', 'FY 2026-27', '2026-05 May 2026 Internet & Phone Bill.pdf'))
+  has('a home insurance policy with a single word for it is filed', filed, P(ML, 'Property Insurance', 'FY 2026-27', '2026-07 July 2026 Insurance.pdf'))
+  has('an unreadable bill from Adani for your account is filed', filed, P(ML, 'Electricity Bills', 'FY 2026-27', '2026-08 August 2026 Electricity Bill.pdf'))
+  has('a bill whose PDF reads badly is filed when the email says it is the bill', filed, P(SD, 'Electricity Bills', 'FY 2026-27', '2026-05 May 2026 Electricity Bill.pdf'))
+  ok('a notice with an account number and an amount stays out', /^Skipped/.test(why('Deposit.pdf')), why('Deposit.pdf'))
+  ok('a mobile bill advertising broadband stays out', /Skipped: .*mobile phone bill/.test(why('Mobile.pdf')), why('Mobile.pdf'))
+  ok('a card statement that lists an electricity payment stays out', /Skipped: A bank or card statement/.test(why('Card.pdf')), why('Card.pdf'))
+  ok('a car service invoice with your address stays out', /^Skipped/.test(why('Service.pdf')), why('Service.pdf'))
+  ok('an online order for plumbing tape stays out', /^Skipped/.test(why('Order.pdf')), why('Order.pdf'))
+  eq('nothing else is filed', filed.filter((p) => !p.endsWith('Bill Sorter Settings')).length, 7)
+}
+
+console.log('\n── LOOKING AGAIN AT WHAT WAS SKIPPED ──')
+{
+  const k = makeWorld()
+  k.run('processBills()') // makes the sheet
+  k.tab('Log').maxRows = 2 // a full Log tab: room has to be added before writing
+  const HOME = "2, Mother's Love, Pankaj CHS, Evershine Ngr, Malad West"
+  const phone = (date) => pdf('Phone.pdf', `Airtel postpaid\n${HOME}\nRelationship No 1234567890\nBill date ${date}\nAmount payable Rs 599.00`)
+  const both = k.thread({ from: 'Me <me@example.com>', subject: 'Fwd: bills', date: '2026-06-06T09:00:00+05:30', body: 'two bills',
+    attachments: [pdf('Adani.pdf', 'Adani Electricity\nCA No: 102401902\nBill Month: MAY-2026\nAmount payable 1,800.00'), phone('05-06-2026')] })
+  const alone = k.thread({ from: 'Airtel <ebill@airtel.in>', subject: 'Your Airtel bill', date: '2026-07-06T09:00:00+05:30', body: 'Attached.',
+    attachments: [phone('05-07-2026')] })
+  k.run('processBills()')
+  eq('each attachment is logged, past the end of the tab', k.log().map((x) => x.Result).join(', '), 'Filed, Skipped, Skipped')
+  // the phone turns out to be the flat's landline-and-mobile plan: its number goes in the sheet
+  k.tab('Properties').rows[1][1] = '102401902, 210000800764, 1234567890'
+  k.run('retrySkipped()')
+  eq('the skipped rows leave the log', k.log().map((x) => x.Result).join(', '), 'Filed')
+  ok('and their emails lose the label', !both.messages[0].labels.has(k.label) && !alone.messages[0].labels.has(k.label))
+  k.run('processBills()')
+  const filed = k.paths().filter((p) => p.includes('Internet & Telecom'))
+  eq('both phone bills are filed this time, the one beside a filed bill included', filed.length, 2)
+  eq('the bill filed before is not filed or logged again', k.log().filter((x) => x.Attachment === 'Adani.pdf').length, 1)
+  eq('one Electricity bill in Drive', k.paths().filter((p) => p.includes('Electricity Bills')).length, 1)
+  ok('the emails are labelled again', both.messages[0].labels.has(k.label) && alone.messages[0].labels.has(k.label))
+  ok('and nothing is left marked to look at again', ![...k.store.keys()].some((x) => x.startsWith('recheck:')))
 }
 
 console.log('\n── STARTING OVER ──')

@@ -33,8 +33,8 @@ const CONFIG = {
     'electricity', 'adani', 'tata power', 'mahavitaran', 'msedcl', 'best undertaking', 'mahanagar gas',
     'mgl', 'gas bill', 'water bill', 'water charges', 'property tax', 'municipal', 'mcgm', 'maintenance',
     'society', 'chs', 'sinking fund', 'broadband', 'fibernet', 'airtel', 'jio', 'rent', 'lease',
-    'leave and licence', 'tenant', 'home insurance', 'fire insurance', 'repair', 'plumbing', 'pest control',
-    'termite',
+    'leave and licence', 'tenant', 'home insurance', 'fire insurance', 'householder', 'repair', 'plumbing',
+    'pest control', 'termite',
   ],
   // Opening an attachment (Drive's OCR) is the slow part: seconds to a minute each.
   // 'when-needed' opens one only when the email alone can't say whose bill it is, which is fast;
@@ -47,13 +47,22 @@ const CONFIG = {
   DAILY_MINUTES: 80,                     // scheduled runs stop for the day here (Google allows 90)
   MAX_ATTEMPTS: 3,                       // a thread that errors this many runs in a row is labelled anyway
   OCR_LANGUAGE: 'en',
-  // A subject or attachment name with one of these is a receipt, a reminder or a notice, not a
-  // new bill, so it is skipped.
-  NOT_A_BILL: ['payment received', 'payment successful', 'payment confirmation', 'payment confirmed',
-    'thank you for your payment', 'thank you for the payment', 'payment receipt', 'transaction successful',
-    'paid successfully', 'reminder', 'overdue', 'past due', 'disconnection notice', 'final notice',
-    'newsletter', 'tariff', 'brochure', 'terms and conditions', 'outage', 'shutdown', 'circular', 'agm',
-    'annual general meeting', 'notice of meeting', 'offer', 'cashback', 'kyc'],
+  // A subject or attachment name with one of these is a payment receipt, not a bill: skipped.
+  PAYMENTS: ['payment received', 'payment successful', 'payment is successful', 'payment confirmation',
+    'payment confirmed', 'thank you for your payment', 'thank you for the payment', 'thank you for paying',
+    'payment receipt', 'payment acknowledgement', 'payment acknowledgment', 'transaction successful',
+    'paid successfully', 'cashback'],
+  // One with these is a reminder or a notice: skipped too, unless the subject also calls it a bill
+  // ("Reminder: maintenance bill for May", "Maintenance bill and AGM notice"). Then each attachment
+  // is judged on its own, so the bill is filed and the AGM notice isn't.
+  NOTICES: ['reminder', 'overdue', 'past due', 'disconnection notice', 'final notice', 'newsletter', 'tariff',
+    'brochure', 'terms and conditions', 'outage', 'shutdown', 'circular', 'agm', 'annual general meeting',
+    'notice of meeting', 'offer', 'kyc'],
+  // An attachment with one of these is never a property bill, whatever address is on it: bank and
+  // card statements, online orders, car service bills.
+  NOT_PROPERTY: ['statement of account', 'account statement', 'credit card statement', 'card statement',
+    'minimum amount due', 'credit limit', 'order id', 'sold by', 'ship to', 'shipping address', 'chassis',
+    'odometer'],
   SAME_BILL_DAYS: 7,                     // two copies of one account's bill this close together are one bill
 };
 
@@ -87,8 +96,9 @@ const STARTING_PROPERTIES = [
 // rent and repair bills don't, since plenty of those (your own mobile, your car) aren't about a property.
 // recurring: one bill per account per period, so a second copy of it is a duplicate. Repair
 // invoices, policies and receipts can legitimately come several to a month.
-// needsAccount: filed only when its account number is in the sheet. Your address is on your own
-// mobile bill too, so for phone and internet bills an address match isn't enough.
+// needsAccount: your address is on your own mobile bill too, so a phone bill is filed only when
+// its account number is in the sheet. Broadband and landline bills (fixedLine: words in the
+// subject, file name or bill; fixedLineSenders: broadband-only companies) go by address as usual.
 // Anything that is none of these types isn't filed at all.
 const UTILITIES = [
   {
@@ -115,6 +125,9 @@ const UTILITIES = [
   {
     folder: 'Internet & Telecom', label: 'Internet & Phone Bill', short: 'Internet', inArrears: true, newProperty: false,
     recurring: true, needsAccount: true,
+    fixedLine: ['broadband', 'fibernet', 'fiber', 'fibre', 'jiofiber', 'airfiber', 'landline', 'ftth',
+      'internet bill', 'internet plan', 'internet service'],
+    fixedLineSenders: ['actcorp', 'hathway', 'excitel'],
     senders: ['airtel.in', 'airtel.com', 'jio.com', 'mtnl', 'bsnl', 'actcorp', 'hathway', 'tataplay', 'excitel'],
     keywords: ['broadband', 'fibernet', 'jiofiber', 'jio', 'airtel', 'xstream', 'postpaid', 'landline', 'mtnl',
       'bsnl', 'hathway', 'internet bill', 'internet plan', 'internet service', 'data usage', 'wifi',
@@ -132,7 +145,8 @@ const UTILITIES = [
     recurring: false,
     senders: [],
     keywords: ['home insurance', 'fire insurance', 'householder', 'householders', 'property insurance',
-      'building insurance', 'griha raksha', 'home shield', 'dwelling'],
+      'building insurance', 'house insurance', 'home package', 'home protect', 'griha raksha', 'home shield',
+      'dwelling', 'standard fire', 'special perils', 'home contents'],
   },
   {
     folder: 'Lease & Rent Agreements', label: 'Rent', short: 'Rent', inArrears: false, newProperty: false,
@@ -236,28 +250,101 @@ function startOver() {
       console.log('Not finished yet: run startOver again.');
       return;
     }
-    const rows = ctx.logSheet.getLastRow() - 1;
-    let unlabelled = 0;
-    if (rows > 0) {
-      const ids = {};
-      ctx.logSheet.getRange(2, LOG_HEADERS.indexOf('Email') + 1, rows, 1).getValues().forEach((r) => {
-        const m = /\/([^\/#?]+)\s*$/.exec(String(r[0]));
-        if (m) ids[m[1]] = true;
-      });
-      const threads = Object.keys(ids).map(threadById_).filter(Boolean);
-      for (let i = 0; i < threads.length; i += 100) ctx.label.removeFromThreads(threads.slice(i, i + 100));
-      unlabelled = threads.length;
-      ctx.logSheet.deleteRows(2, rows);
+    const forgot = forgetRows_(ctx, () => true);
+    if (forgot.unfinished) {
+      console.log('Not finished yet: run startOver again.');
+      return;
     }
     const props = PropertiesService.getScriptProperties();
     props.getKeys().forEach((k) => {
-      if (k.indexOf('attempts:') === 0) props.deleteProperty(k);
+      if (k.indexOf('attempts:') === 0 || k.indexOf('recheck:') === 0) props.deleteProperty(k);
     });
-    console.log('Cleared. ' + unlabelled + ' emails will be sorted again, starting with the next run ' +
+    console.log('Cleared. ' + forgot.threads + ' emails will be sorted again, starting with the next run ' +
       '(or run processBills now).');
   } finally {
     if (ownClock) clock_.started = null;
   }
+}
+
+/**
+ * Run by hand to have everything the Log shows as Skipped looked at again, for instance after
+ * changing the code or adding an account number or keyword to a property. Bills already filed
+ * stay where they are. If it runs out of time it says so: run it again to finish.
+ */
+function retrySkipped() {
+  const ownClock = startClock_();
+  try {
+    const ctx = openContext_();
+    const result = LOG_HEADERS.indexOf('Result');
+    const forgot = forgetRows_(ctx, (row) => String(row[result]) === 'Skipped');
+    console.log(forgot.rows + ' skipped attachments in ' + forgot.threads + ' emails will be looked at again, ' +
+      'starting with the next run (or run processBills now).' +
+      (forgot.unfinished ? ' Not finished yet: run retrySkipped again for the rest.' : ''));
+  } finally {
+    if (ownClock) clock_.started = null;
+  }
+}
+
+// Takes the log rows that pass the test out of the Log tab and the Bill Records label off their
+// emails, so the next runs sort those attachments again. An email that keeps other rows (a bill
+// filed beside a skipped leaflet) is marked to be looked at again, or it would count as finished.
+// Stops when time runs short and leaves the rest for another go.
+function forgetRows_(ctx, test) {
+  const out = { threads: 0, rows: 0, unfinished: false };
+  const sheet = ctx.logSheet;
+  const last = sheet.getLastRow();
+  if (last < 2) return out;
+  const col = (name) => LOG_HEADERS.indexOf(name);
+  const rows = sheet.getRange(2, 1, last - 1, LOG_HEADERS.length).getValues();
+  const threadOf = (row) => {
+    const m = /\/([^\/#?]+)\s*$/.exec(String(row[col('Email')]));
+    return m ? m[1] : '';
+  };
+  const ids = [];
+  const seen = {};
+  rows.forEach((row) => {
+    const id = threadOf(row);
+    if (id && test(row) && !seen[id]) {
+      seen[id] = true;
+      ids.push(id);
+    }
+  });
+  const unlabelled = {};
+  let batch = [];
+  for (let i = 0; i < ids.length; i++) {
+    if (past_(CONFIG.RUN_MINUTES)) {
+      out.unfinished = true;
+      break;
+    }
+    const thread = threadById_(ids[i]);
+    if (thread) batch.push(thread);
+    unlabelled[ids[i]] = true;
+    if (batch.length === 100) {
+      ctx.label.removeFromThreads(batch);
+      batch = [];
+    }
+  }
+  if (batch.length) ctx.label.removeFromThreads(batch);
+  out.threads = Object.keys(unlabelled).length;
+
+  const forget = (row) => test(row) && (unlabelled[threadOf(row)] || !threadOf(row));
+  const messageOf = (row) => String(row[col('Key')]).split(':')[0];
+  const forgotten = {};
+  rows.filter(forget).forEach((row) => {
+    forgotten[messageOf(row)] = true;
+  });
+  const keep = rows.filter((row) => !forget(row));
+  out.rows = rows.length - keep.length;
+  const recheck = {};
+  keep.forEach((row) => {
+    if (forgotten[messageOf(row)]) recheck['recheck:' + messageOf(row)] = '1';
+  });
+  if (Object.keys(recheck).length) PropertiesService.getScriptProperties().setProperties(recheck);
+  sheet.getRange(2, 1, last - 1, LOG_HEADERS.length).clearContent();
+  // Read back, text that looks like a formula has lost its protecting apostrophe.
+  const values = keep.map((row) => row.map((v) => (typeof v === 'string' ? cell_(v) : v)));
+  if (values.length) sheet.getRange(2, 1, values.length, LOG_HEADERS.length).setValues(values);
+  return out;
 }
 
 function threadById_(id) {
@@ -431,7 +518,13 @@ function processMessage_(message, thread, ctx, tally) {
     if (r.result !== 'Error') ctx.done.add(r.key);
     tally[r.result] = (tally[r.result] || 0) + 1;
   });
-  if (!failed) ctx.doneMessages.add(message.getId());
+  if (!failed) {
+    ctx.doneMessages.add(message.getId());
+    if (ctx.recheck[message.getId()]) {
+      PropertiesService.getScriptProperties().deleteProperty('recheck:' + message.getId());
+      delete ctx.recheck[message.getId()];
+    }
+  }
   return failed ? 'failed' : 'ok';
 }
 
@@ -506,9 +599,10 @@ function handleAttachment_(message, item, ctx) {
         note = "Couldn't read the attachment itself (" + read.error + '), so this is based on the email.';
       } else {
         texts.doc = normalize_(read.text).slice(0, 30000); // a bill's details are on its first pages
-        v = classify_(texts, ctx.properties, message.getDate());
       }
     }
+    texts.unread = texts.doc.length < 40;
+    v = classify_(texts, ctx.properties, message.getDate());
   }
   const outcome = {
     utility: v.utility.folder,
@@ -599,6 +693,8 @@ function textsFor_(message, item, docText) {
     body: normalize_(String(message.getPlainBody() || '').slice(0, 20000)),
     from: normalize_(message.getFrom()),
     file: normalize_(item.name.replace(/\.[a-z0-9]{2,4}$/i, '').replace(/_+/g, ' ')),
+    photo: item.type.indexOf('image/') === 0,
+    unread: false, // set when the attachment was too big to open or couldn't be read
   };
 }
 
@@ -652,58 +748,102 @@ const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 
   'October', 'November', 'December'];
 
 // A bill has an amount and something only bills have: a due date, a bill number or date, a
-// billing period. Notices, newsletters, statements and circulars mostly don't.
+// billing period. Notices, newsletters and circulars mostly don't. The labels allow for the
+// dots, colons and missing spaces of OCR ("Due Dt.", "Bill No:", "BillNo").
 const MONEY = /(?:₹|\brs\.?\s*\d|\binr\b|\bamount\b|\btotal\b|\bpayable\b|\bpremium\b)/;
-const BILLNESS = /\b(?:due date|due on|pay by|payable by|last date|bill date|bill no|bill number|invoice no|invoice number|invoice date|bill month|billing month|billing period|bill period|bill for the period|amount payable|amount due|total due|net payable|total payable|receipt no|monthly rent|rent receipt|licen[cs]e fee|leave and licen[cs]e|policy period|period of insurance)\b/;
+const BILL_LABELS = ['due date', 'due dt', 'due on', 'due by', 'pay by', 'pay before', 'payable by',
+  'payable before', 'pay on or before', 'payable on or before', 'last date', 'bill date', 'bill dt', 'billing date',
+  'date of bill', 'bill no', 'bill number', 'bill id', 'bill month', 'billing month', 'bill period', 'billing period',
+  'billing cycle', 'bill for the period', 'bill for the month', 'bill amount', 'current bill', 'current charges',
+  'invoice no', 'invoice number', 'invoice date', 'inv no', 'amount payable', 'payable amount', 'amount due',
+  'total due', 'net payable', 'total payable', 'net amount', 'amount to be paid', 'receipt no', 'monthly rent',
+  'rent receipt', 'licence fee', 'license fee', 'leave and licence', 'leave and license', 'policy period',
+  'period of insurance', 'period of cover', 'policy no', 'policy number', 'sum insured'];
+const BILLNESS = new RegExp('(?:^|[^a-z])(?:' +
+  BILL_LABELS.map((label) => label.split(' ').join('[\\s.:/-]*')).join('|') + ')(?![a-z])');
+const BILL_WORD = /(?:^|[^a-z])(?:e-?)?(?:bill|invoice)s?(?![a-z])/;
+// The heading of a bill: "Maintenance Bill", "Tax Invoice", "e-Bill". Not "your next bill".
+const BILL_HEADING = new RegExp('(?:^|[^a-z])(?:(?:maintenance|electricity|energy|gas|water|tax|society|' +
+  'telephone|broadband|internet|e-?)\\s*bill|(?:tax\\s*)?invoice|bill of supply|rent receipt)(?![a-z])');
+const NOTICE_WORD = /(?:^|[^a-z])(?:notice|circular|reminder|newsletter|statement|minutes|agenda)(?![a-z])/;
 
-// Whether this is a bill at all. From the attachment when it was read; when it couldn't be,
-// from an email that calls it a bill or invoice.
-function looksLikeBill_(t) {
-  if (t.doc.length >= 40) return MONEY.test(t.doc) && BILLNESS.test(t.doc);
-  return /(?:^|[^a-z])(?:e-?)?(?:bill|invoice)s?(?![a-z])/.test(t.subject + ' ' + t.file);
+// How far it reads like a bill:
+//   'bill'   the attachment has an amount and a due date, bill number, bill date or billing period,
+//            or an amount under a heading like "Maintenance Bill" or "Tax Invoice"
+//   'amount' the attachment has an amount and nothing else of a bill
+//   'email'  the attachment wasn't read (or couldn't be), and the email calls it a bill or invoice
+//   'sender' it couldn't be read, and it came from the utility itself
+//   ''       nothing says it is a bill
+function billEvidence_(t, found) {
+  if (t.doc.length >= 40) {
+    if (!MONEY.test(t.doc)) return '';
+    if (BILLNESS.test(t.doc)) return 'bill';
+    // A heading is at the top; OCR reads a photo in no particular order, so anywhere in one.
+    const head = t.photo ? t.doc : t.doc.slice(0, 300);
+    if (BILL_HEADING.test(head) && !NOTICE_WORD.test(head)) return 'bill';
+    return 'amount';
+  }
+  if (BILL_WORD.test(t.subject + ' ' + t.file)) return 'email';
+  if (t.unread && found.sender) return 'sender';
+  return '';
 }
 
 // t holds the lower-cased text of the attachment (doc), subject, body, from line and file name.
 // Returns what to do with the bill, and the utility, month, financial year and file name.
 function classify_(t, properties, arrived) {
-  const found = detectUtility_(t);
-  const utility = found.utility;
-  const month = detectBillMonth_(t, utility, arrived);
   const match = matchProperty_(t, properties);
+  const found = detectUtility_(t);
+  // One of your account numbers says whose bill it is, so a faint sign of its type will do
+  // (the word "electricity" in the email, say).
+  const utility = found.utility === OTHER && match.accounts.length && found.weak ? found.weak : found.utility;
+  const month = detectBillMonth_(t, utility, arrived);
+  const evidence = billEvidence_(t, found);
+  const not = notABill_(t);
   const v = {
     utility: utility, utilityScore: found.score, month: month, fy: financialYear_(month),
     fileBase: fileBase_(month, utility), match: match, account: '', action: '', notes: '',
-    billNo: extractBillNo_(t), accountId: '', notABill: notABill_(t),
+    billNo: extractBillNo_(t), accountId: '', notABill: Boolean(not),
   };
-  if (v.notABill) {
+  const named = match.property ? match.property.name : '';
+  const skip = (notes) => {
     v.action = 'skip';
-    v.notes = 'A receipt, reminder or notice, not a bill.';
+    v.notes = notes;
+  };
+  if (not === 'payment') {
+    skip('A payment receipt or confirmation, not a bill.');
+  } else if (not) {
+    skip('A reminder or notice, not a bill.');
   } else if (utility === OTHER) {
-    v.action = 'skip';
-    v.notes = 'Not one of the bill types it files.';
-  } else if (!looksLikeBill_(t)) {
-    v.action = 'skip';
-    v.notes = "Doesn't read like a bill: no amount with a due date, bill number or billing period.";
+    skip('Not one of the bill types it files.');
+  } else if (notProperty_(t)) {
+    skip('A bank or card statement, an online order or a vehicle bill, not a property bill.');
+  } else if (!evidence) {
+    skip("Doesn't read like a bill: no amount, or nothing a bill has (a due date, bill number, bill date or " +
+      'billing period).');
   } else if (match.ambiguous) {
     v.action = 'review';
     v.notes = 'Matches ' + match.ambiguous.join(' and ') + ' equally.';
-  } else if (match.property && utility.needsAccount && !match.accounts.length) {
-    v.action = 'skip';
-    v.notes = 'Matches ' + match.property.name + ' only by address. ' + utility.short + ' bills are filed ' +
-      'only when their account number is in the sheet, so your own phone bills stay out.';
-  } else if (match.property && !match.accounts.length && found.score < 3) {
-    v.action = 'skip';
-    v.notes = 'Matches ' + match.property.name + ' only by address, and too little says it is a ' +
-      utility.short.toLowerCase() + ' bill.';
+  } else if (match.property && match.accounts.length && evidence === 'amount' &&
+      !BILL_WORD.test(t.subject + ' ' + t.file)) {
+    skip('Has an account number of ' + named + ' and an amount, but neither it nor the email says bill: no ' +
+      'due date, bill number, bill date or billing period.');
+  } else if (match.property && match.accounts.length) {
+    v.action = 'file';
+  } else if (match.property && (evidence === 'amount' || evidence === 'sender')) {
+    skip('Matches ' + named + ' only by address, and ' + (evidence === 'amount'
+      ? 'has an amount but no due date, bill number, bill date or billing period.'
+      : "the attachment couldn't be read.") + ' Add its account number to the sheet to file it anyway.');
+  } else if (match.property && utility.needsAccount && !fixedLine_(t, utility)) {
+    skip('Matches ' + named + ' only by address, and reads like a mobile phone bill. Phone bills are filed ' +
+      'only when their account number is in the sheet, so your own mobile stays out; broadband and landline ' +
+      'bills go by address.');
   } else if (match.property) {
     v.action = 'file';
-  } else if (found.score < 4) {
-    v.action = 'skip';
-    v.notes = 'Not clearly a property bill.';
+  } else if (evidence === 'amount' || evidence === 'sender' || found.score < 4) {
+    skip('Not clearly a property bill.');
   } else if (!utility.newProperty) {
-    v.action = 'skip';
-    v.notes = 'A ' + utility.short.toLowerCase() + ' bill that matches none of your properties. If it is for ' +
-      'one of them, add its account number to that property in the sheet.';
+    skip('A ' + utility.short.toLowerCase() + ' bill that matches none of your properties. If it is for ' +
+      'one of them, add its account number to that property in the sheet.');
   } else {
     // A bill for a property the sheet doesn't have yet: its account number starts a new one.
     v.account = extractAccount_(t);
@@ -715,9 +855,33 @@ function classify_(t, properties, arrived) {
   return v;
 }
 
+// 'payment' for a payment receipt, 'notice' for a reminder or notice, '' otherwise. The file
+// name always counts; the subject only when it doesn't also call the email a bill.
 function notABill_(t) {
-  if (!notABill_.patterns) notABill_.patterns = CONFIG.NOT_A_BILL.map(phraseRegex_).filter(Boolean);
-  return notABill_.patterns.some((re) => re.test(t.subject) || re.test(t.file));
+  if (!notABill_.payments) {
+    notABill_.payments = CONFIG.PAYMENTS.map(phraseRegex_).filter(Boolean);
+    notABill_.notices = CONFIG.NOTICES.map(phraseRegex_).filter(Boolean);
+  }
+  const saysBill = BILL_WORD.test(t.subject);
+  if (notABill_.payments.some((re) => re.test(t.subject) || re.test(t.file))) return 'payment';
+  if (notABill_.notices.some((re) => re.test(t.file) || (!saysBill && re.test(t.subject)))) return 'notice';
+  return '';
+}
+
+function notProperty_(t) {
+  if (!notProperty_.patterns) notProperty_.patterns = CONFIG.NOT_PROPERTY.map(phraseRegex_).filter(Boolean);
+  return notProperty_.patterns.some((re) => re.test(t.doc) || re.test(t.subject) || re.test(t.file));
+}
+
+// Whether a phone or internet bill is for a broadband or landline connection (a place) rather than
+// a mobile (a person). The bill's own text counts unless it is a postpaid or prepaid mobile bill
+// advertising broadband.
+function fixedLine_(t, utility) {
+  if (!utility.fixedLine) return false;
+  if (!utility.fixedPatterns) utility.fixedPatterns = utility.fixedLine.map(phraseRegex_).filter(Boolean);
+  if ((utility.fixedLineSenders || []).some((s) => t.from.indexOf(s) !== -1)) return true;
+  if (utility.fixedPatterns.some((re) => re.test(t.subject) || re.test(t.file))) return true;
+  return !/(?:^|[^a-z])(?:postpaid|prepaid)(?![a-z])/.test(t.doc) && utility.fixedPatterns.some((re) => re.test(t.doc));
 }
 
 const BILL_NO_RE = /(?:^|[^a-z])(?:bill|invoice)\s*(?:no\b|number\b|num\b|#)\.?\s*[:#.-]?\s*([a-z0-9][a-z0-9\/-]{0,30})/g;
@@ -736,18 +900,22 @@ function extractBillNo_(t) {
   return '';
 }
 
+// The bill type with the most evidence, if it has enough; weak is the leader even when it hasn't,
+// and sender says whether the email came from that utility's own address.
 function detectUtility_(t) {
-  let best = { utility: OTHER, score: 0 };
+  let best = { utility: OTHER, score: 0, sender: false };
   UTILITIES.forEach((u) => {
-    let score = u.senders.some((s) => t.from.indexOf(s) !== -1) ? 5 : 0;
+    const sender = u.senders.some((s) => t.from.indexOf(s) !== -1);
+    let score = sender ? 5 : 0;
     patternsFor_(u).forEach((re) => {
       if (re.test(t.subject) || re.test(t.file)) score += 3;
       else if (re.test(t.doc)) score += 2;
       else if (re.test(t.body)) score += 1;
     });
-    if (score > best.score) best = { utility: u, score: score };
+    if (score > best.score) best = { utility: u, score: score, sender: sender };
   });
-  return best.score >= 2 ? best : { utility: OTHER, score: best.score };
+  if (best.score >= 2) return best;
+  return { utility: OTHER, score: best.score, sender: false, weak: best.score ? best.utility : null };
 }
 
 function patternsFor_(utility) {
@@ -1092,6 +1260,13 @@ function openContext_() {
   };
   ctx.properties = loadProperties_(ctx, props);
   Object.assign(ctx, loadMemory_(ctx.logSheet));
+  // Emails retrySkipped wants looked at again, though the log shows a bill filed from them.
+  ctx.recheck = {};
+  props.getKeys().forEach((k) => {
+    if (k.indexOf('recheck:') !== 0) return;
+    ctx.recheck[k.slice(8)] = true;
+    ctx.doneMessages.delete(k.slice(8));
+  });
   return ctx;
 }
 
@@ -1443,7 +1618,11 @@ function logValues_(thread, message, item, o, key) {
 function writeLog_(ctx, rows) {
   if (!rows.length) return;
   const sheet = ctx.logSheet;
-  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, LOG_HEADERS.length).setValues(rows);
+  const first = sheet.getLastRow() + 1;
+  // A new tab has 1000 rows and writing past the last one fails, so room is added first.
+  const short = first + rows.length - 1 - sheet.getMaxRows();
+  if (short > 0) sheet.insertRowsAfter(sheet.getMaxRows(), Math.max(short, 500));
+  sheet.getRange(first, 1, rows.length, LOG_HEADERS.length).setValues(rows);
 }
 
 // Sheets would run text that starts like a formula; an apostrophe in front keeps it as text.
