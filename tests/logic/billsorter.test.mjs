@@ -104,7 +104,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
     // Gmail matches messages, so a thread comes back while any message in it lacks the label.
     search: (query, start, max) => {
       w.queries.push(query)
-      return threads.filter((t) => t.messages.some((m) => !m.labels.has('Bill Sorter'))).slice(start, start + max)
+      return threads.filter((t) => t.messages.some((m) => !m.labels.has(w.label))).slice(start, start + max)
     },
   }
   const attachment = (a) => ({
@@ -227,6 +227,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
   if (withDrive) sandbox.Drive = Drive
   const ctx = vm.createContext(sandbox)
   vm.runInContext(CODE, ctx)
+  w.label = vm.runInContext('CONFIG.LABEL', ctx)
 
   Object.assign(w, {
     ctx, store, triggers, threads,
@@ -373,6 +374,13 @@ Amount payable 2,500.00`)],
     from: 'Someone <someone@example.com>', subject: 'bill', date: '2026-06-16T09:00:00+05:30', body: 'hi',
     attachments: [{ name: 'logo.png', type: 'image/png', size: 4 * 1024, text: 'logo' }],
   })
+  // Already handled by the old script, which used the same label.
+  t.oldScript = w.thread({
+    from: ADANI, subject: 'Adani Electricity Bill for CA No. 102401902', date: '2026-03-04T09:00:00+05:30',
+    body: 'Please find attached your bill.',
+    attachments: [pdf('Old_Bill.pdf', 'Adani Electricity\nCA No: 102401902\nBill Month: FEB-2026\nAmount payable 1,500.00')],
+  })
+  t.oldScript.addLabel({ getName: () => 'Bill Records' })
   return t
 }
 
@@ -521,6 +529,7 @@ eq('the gas bill needs review', row('MGL.pdf').Result, 'Needs review')
 ok('the unreadable scan says so in the notes', /Couldn't read the attachment/.test(row('Scan.pdf').Notes), row('Scan.pdf').Notes)
 ok('the banner never reached the log', !row('banner.png').Result)
 ok('nor the logo', !row('logo.png').Result)
+ok('mail the old script already labelled "Bill Records" is left alone', !row('Old_Bill.pdf').Result)
 ok('each row links to its email', /^https:\/\/mail\.google\.com\//.test(row('MGL.pdf').Email))
 ok('and to its file in Drive', /^https:\/\/drive\.google\.com\//.test(row('MGL.pdf')['Drive file']))
 
@@ -530,9 +539,10 @@ eq('the new one is named after its account', propsTab[4][0], 'New property - Ele
 eq('with the account number filled in', propsTab[4][1], '900012345678')
 ok('and a note saying where it came from', /^Added automatically on \d+ \w+ 2026 from "Your Tata Power bill"/.test(propsTab[4][4]), propsTab[4][4])
 ok('every property row has its folder ID', propsTab.slice(1).every((r) => /^folder\d+$/.test(r[3])), JSON.stringify(propsTab.map((r) => r[3])))
-ok('every thread is labelled', w.threads.every((t) => t.messages.every((m) => m.labels.has('Bill Sorter'))))
+eq('the Gmail label is still "Bill Records"', w.label, 'Bill Records')
+ok('every thread is labelled', w.threads.every((t) => t.messages.every((m) => m.labels.has(w.label))))
 const q = w.queries[0]
-ok('the search leaves labelled mail out', q.includes('-label:bill-sorter'), q)
+ok('the search leaves labelled mail out', q.includes('-label:bill-records'), q)
 ok('looks for PDFs and photos', q.includes('(filename:pdf OR filename:jpg OR filename:jpeg OR filename:png)'), q)
 ok('quotes phrases', q.includes('"property tax"'), q)
 ok('and includes your account numbers', q.includes('102401902') && q.includes('149209100000059'), q)
@@ -602,11 +612,11 @@ const flaky = w.thread({
 })
 w.run('processBills()')
 eq('the error is logged', w.log().at(-1).Result, 'Error')
-ok('and the thread is left unlabelled to try again', !flaky.messages[0].labels.has('Bill Sorter'))
+ok('and the thread is left unlabelled to try again', !flaky.messages[0].labels.has(w.label))
 w.failCreateFile = false
 w.run('processBills()')
 eq('the next run files it', w.log().at(-1).Result, 'Filed')
-ok('and labels the thread', flaky.messages[0].labels.has('Bill Sorter'))
+ok('and labels the thread', flaky.messages[0].labels.has(w.label))
 ok('and forgets the failed attempt', ![...w.store.keys()].some((k) => k.startsWith('attempts:')))
 
 w.failCreateFile = true
@@ -617,9 +627,9 @@ const broken = w.thread({
 })
 w.run('processBills()')
 w.run('processBills()')
-ok('two failures in a row still leave it to retry', !broken.messages[0].labels.has('Bill Sorter'))
+ok('two failures in a row still leave it to retry', !broken.messages[0].labels.has(w.label))
 w.run('processBills()')
-ok('a third failure gives up and labels it, so it can\'t block the queue', broken.messages[0].labels.has('Bill Sorter'))
+ok('a third failure gives up and labels it, so it can\'t block the queue', broken.messages[0].labels.has(w.label))
 eq('with three errors in the log', w.log().filter((r) => r.Attachment === 'Bill_Sep.pdf' && r.Result === 'Error').length, 3)
 w.failCreateFile = false
 

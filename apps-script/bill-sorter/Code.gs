@@ -20,7 +20,7 @@
 const CONFIG = {
   BASE_FOLDER: 'Property Bills',         // top-level folder in My Drive
   SETTINGS_FILE: 'Bill Sorter Settings', // spreadsheet with the Properties and Log tabs
-  LABEL: 'Bill Sorter',                  // put on each Gmail thread once it has been handled
+  LABEL: 'Bill Records',                 // put on each Gmail thread once it has been handled
   NEEDS_REVIEW: '_Needs Review',         // bills whose property couldn't be worked out
   TIME_ZONE: 'Asia/Kolkata',
   SEARCH_SINCE: '',                      // e.g. '2024/04/01' to leave older mail alone; '' = all of it
@@ -190,7 +190,7 @@ function outOfTime_(started) {
 function buildQuery_(properties) {
   const terms = CONFIG.SEARCH_TERMS.map((term) => (/\s/.test(term) ? '"' + term + '"' : term));
   properties.forEach((p) => p.accounts.forEach((account) => terms.push(account)));
-  // Gmail's search spells a label with spaces as hyphens: "Bill Sorter" → label:bill-sorter
+  // Gmail's search spells a label with spaces as hyphens: "Bill Records" → label:bill-records
   const label = CONFIG.LABEL.toLowerCase().replace(/\s+/g, '-');
   return 'has:attachment -label:' + label +
     ' (filename:pdf OR filename:jpg OR filename:jpeg OR filename:png)' +

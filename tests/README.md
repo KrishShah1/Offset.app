@@ -19,7 +19,7 @@ under plain `node`.
 
 | Suite | Assertions | Covers |
 |---|---|---|
-| `billsorter.test.mjs` | 126 | Gmail bill sorter: matching, months, new properties, retries |
+| `billsorter.test.mjs` | 128 | Gmail bill sorter: matching, months, new properties, retries |
 | `brokers.test.mjs` | 42 | broker holdings exports, column aliasing |
 | `corp.test.mjs` | 106 | entities, control, ledgers, audit events |
 | `i18n.test.mjs` | 81 | dictionaries, plurals, coverage |
@@ -29,7 +29,7 @@ under plain `node`.
 | `onboarding.test.mjs` | 44 | empty install, sample data |
 | `ops.test.mjs` | 151 | inventory, payables, advances, payroll |
 | `store.test.mjs` | 65 | corporate storage layer |
-| | **912** | |
+| | **914** | |
 
 ## Browser — `tests/browser/`
 
