@@ -76,11 +76,29 @@ financial year it chose and why, and what it matched on. The results:
 | Filed (new property) | Started a new property row and folder |
 | Needs review | In `_Needs Review`: no known account or keyword, or two properties matched equally |
 | Duplicate | Already filed: the same file, or the same bill sent again (same bill number, or same account and month) |
-| Skipped | Not a new property bill: payment receipts, reminders, shopping invoices, restaurant bills, terms and conditions, or a phone, insurance or rent bill that matches none of your properties |
+| Skipped | Not a property bill: see below |
 | Error | Something failed; it tries again next run, up to three times |
 
 **_Needs Review.** Move the file by hand, then add the account number or a keyword to the right
 property so the next one goes straight there.
+
+## What gets filed, and what doesn't
+
+Only property bills. An attachment is filed when all of these hold:
+
+- it is one of the bill types in `UTILITIES` (electricity, gas, water, internet and phone, property
+  tax, home or fire insurance, rent, repairs, pest control, society maintenance). Nothing else is
+  filed; there is no "miscellaneous" folder;
+- it reads like a bill: an amount, and a due date, bill number, bill date or billing period;
+- it isn't a receipt, reminder or notice (`NOT_A_BILL`: payment confirmations, outage notices,
+  newsletters, tariff sheets, AGM notices, circulars, offers);
+- it belongs to one of your properties. Your property keywords are your address, which is on
+  everything sent to you, so a match on address alone also needs clear signs of the bill type;
+  and phone and internet bills are filed only when their account number is in the sheet, so your
+  own mobile bill stays out.
+
+So bank and card statements, car and health insurance, shopping invoices, promotions and society
+circulars are skipped and logged with the reason, not filed.
 
 ## Duplicates
 

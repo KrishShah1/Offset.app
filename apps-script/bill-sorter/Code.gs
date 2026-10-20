@@ -33,7 +33,8 @@ const CONFIG = {
     'electricity', 'adani', 'tata power', 'mahavitaran', 'msedcl', 'best undertaking', 'mahanagar gas',
     'mgl', 'gas bill', 'water bill', 'water charges', 'property tax', 'municipal', 'mcgm', 'maintenance',
     'society', 'chs', 'sinking fund', 'broadband', 'fibernet', 'airtel', 'jio', 'rent', 'lease',
-    'leave and licence', 'tenant', 'insurance', 'repair', 'plumbing', 'pest control', 'termite',
+    'leave and licence', 'tenant', 'home insurance', 'fire insurance', 'repair', 'plumbing', 'pest control',
+    'termite',
   ],
   // Opening an attachment (Drive's OCR) is the slow part: seconds to a minute each.
   // 'when-needed' opens one only when the email alone can't say whose bill it is, which is fast;
@@ -46,11 +47,13 @@ const CONFIG = {
   DAILY_MINUTES: 80,                     // scheduled runs stop for the day here (Google allows 90)
   MAX_ATTEMPTS: 3,                       // a thread that errors this many runs in a row is labelled anyway
   OCR_LANGUAGE: 'en',
-  // A subject or attachment name with one of these is a payment receipt or a reminder, not a new
-  // bill, so it is skipped instead of being filed next to the bill it is about.
+  // A subject or attachment name with one of these is a receipt, a reminder or a notice, not a
+  // new bill, so it is skipped.
   NOT_A_BILL: ['payment received', 'payment successful', 'payment confirmation', 'payment confirmed',
     'thank you for your payment', 'thank you for the payment', 'payment receipt', 'transaction successful',
-    'paid successfully', 'reminder', 'overdue', 'past due', 'disconnection notice', 'final notice'],
+    'paid successfully', 'reminder', 'overdue', 'past due', 'disconnection notice', 'final notice',
+    'newsletter', 'tariff', 'brochure', 'terms and conditions', 'outage', 'shutdown', 'circular', 'agm',
+    'annual general meeting', 'notice of meeting', 'offer', 'cashback', 'kyc'],
   SAME_BILL_DAYS: 7,                     // two copies of one account's bill this close together are one bill
 };
 
@@ -84,6 +87,9 @@ const STARTING_PROPERTIES = [
 // rent and repair bills don't, since plenty of those (your own mobile, your car) aren't about a property.
 // recurring: one bill per account per period, so a second copy of it is a duplicate. Repair
 // invoices, policies and receipts can legitimately come several to a month.
+// needsAccount: filed only when its account number is in the sheet. Your address is on your own
+// mobile bill too, so for phone and internet bills an address match isn't enough.
+// Anything that is none of these types isn't filed at all.
 const UTILITIES = [
   {
     folder: 'Electricity Bills', label: 'Electricity Bill', short: 'Electricity', inArrears: true, newProperty: true,
@@ -108,7 +114,7 @@ const UTILITIES = [
   },
   {
     folder: 'Internet & Telecom', label: 'Internet & Phone Bill', short: 'Internet', inArrears: true, newProperty: false,
-    recurring: true,
+    recurring: true, needsAccount: true,
     senders: ['airtel.in', 'airtel.com', 'jio.com', 'mtnl', 'bsnl', 'actcorp', 'hathway', 'tataplay', 'excitel'],
     keywords: ['broadband', 'fibernet', 'jiofiber', 'jio', 'airtel', 'xstream', 'postpaid', 'landline', 'mtnl',
       'bsnl', 'hathway', 'internet bill', 'internet plan', 'internet service', 'data usage', 'wifi',
@@ -125,8 +131,8 @@ const UTILITIES = [
     folder: 'Property Insurance', label: 'Insurance', short: 'Insurance', inArrears: false, newProperty: false,
     recurring: false,
     senders: [],
-    keywords: ['insurance', 'policy schedule', 'policy no', 'policy number', 'sum insured', 'premium',
-      'home insurance', 'fire insurance', 'insured', 'insurer'],
+    keywords: ['home insurance', 'fire insurance', 'householder', 'householders', 'property insurance',
+      'building insurance', 'griha raksha', 'home shield', 'dwelling'],
   },
   {
     folder: 'Lease & Rent Agreements', label: 'Rent', short: 'Rent', inArrears: false, newProperty: false,
@@ -154,8 +160,8 @@ const UTILITIES = [
     recurring: true,
     senders: ['mygate', 'nobrokerhood', 'apnacomplex', 'adda.io', 'chsone'],
     keywords: ['maintenance', 'maintenance bill', 'maintenance charges', 'society maintenance', 'housing society',
-      'co operative housing', 'chs', 'sinking fund', 'repair fund', 'service charges', 'non occupancy',
-      'parking charges', 'society'],
+      'co operative housing', 'sinking fund', 'repair fund', 'service charges', 'non occupancy',
+      'parking charges', 'society charges'],
   },
 ];
 
@@ -645,7 +651,17 @@ function removeQuietly_(id) {
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September',
   'October', 'November', 'December'];
 
-const BILL_WORDS = /\b(?:bill|invoice|receipt|amount|total|payable|due|balance|charges?|premium|rent|tax|paid|consumption)\b/;
+// A bill has an amount and something only bills have: a due date, a bill number or date, a
+// billing period. Notices, newsletters, statements and circulars mostly don't.
+const MONEY = /(?:₹|\brs\.?\s*\d|\binr\b|\bamount\b|\btotal\b|\bpayable\b|\bpremium\b)/;
+const BILLNESS = /\b(?:due date|due on|pay by|payable by|last date|bill date|bill no|bill number|invoice no|invoice number|invoice date|bill month|billing month|billing period|bill period|bill for the period|amount payable|amount due|total due|net payable|total payable|receipt no|monthly rent|rent receipt|licen[cs]e fee|leave and licen[cs]e|policy period|period of insurance)\b/;
+
+// Whether this is a bill at all. From the attachment when it was read; when it couldn't be,
+// from an email that calls it a bill or invoice.
+function looksLikeBill_(t) {
+  if (t.doc.length >= 40) return MONEY.test(t.doc) && BILLNESS.test(t.doc);
+  return /(?:^|[^a-z])(?:e-?)?(?:bill|invoice)s?(?![a-z])/.test(t.subject + ' ' + t.file);
+}
 
 // t holds the lower-cased text of the attachment (doc), subject, body, from line and file name.
 // Returns what to do with the bill, and the utility, month, financial year and file name.
@@ -661,18 +677,26 @@ function classify_(t, properties, arrived) {
   };
   if (v.notABill) {
     v.action = 'skip';
-    v.notes = 'A payment receipt or reminder, not a new bill.';
-  } else if (t.doc.length >= 40 && !BILL_WORDS.test(t.doc)) {
+    v.notes = 'A receipt, reminder or notice, not a bill.';
+  } else if (utility === OTHER) {
     v.action = 'skip';
-    v.notes = 'No bill wording in the attachment.';
+    v.notes = 'Not one of the bill types it files.';
+  } else if (!looksLikeBill_(t)) {
+    v.action = 'skip';
+    v.notes = "Doesn't read like a bill: no amount with a due date, bill number or billing period.";
   } else if (match.ambiguous) {
     v.action = 'review';
     v.notes = 'Matches ' + match.ambiguous.join(' and ') + ' equally.';
-  } else if (match.property && (utility !== OTHER || match.score >= 20)) {
-    v.action = 'file';
-  } else if (match.property) {
+  } else if (match.property && utility.needsAccount && !match.accounts.length) {
     v.action = 'skip';
-    v.notes = 'Not a recognised bill type, and only a weak match to ' + match.property.name + '.';
+    v.notes = 'Matches ' + match.property.name + ' only by address. ' + utility.short + ' bills are filed ' +
+      'only when their account number is in the sheet, so your own phone bills stay out.';
+  } else if (match.property && !match.accounts.length && found.score < 3) {
+    v.action = 'skip';
+    v.notes = 'Matches ' + match.property.name + ' only by address, and too little says it is a ' +
+      utility.short.toLowerCase() + ' bill.';
+  } else if (match.property) {
+    v.action = 'file';
   } else if (found.score < 4) {
     v.action = 'skip';
     v.notes = 'Not clearly a property bill.';

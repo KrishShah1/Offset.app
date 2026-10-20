@@ -834,6 +834,59 @@ console.log('\n── NO DUPLICATE BILLS ──')
   ok('t1 is labelled', t1.messages[0].labels.has(d.label))
 }
 
+console.log('\n── NOTHING BUT BILLS ──')
+{
+  const n = makeWorld()
+  const HOME = "Address: 2, Mother's Love, Pankaj CHS, Evershine Ngr, Malad West"
+  const mail = (from, subject, name, text, body = 'Please find attached.') =>
+    n.thread({ from, subject, date: '2026-06-05T09:00:00+05:30', body, attachments: [pdf(name, text)] })
+  mail('HDFC Bank <alerts@hdfcbank.example>', 'Your account statement', 'Statement.pdf',
+    `Statement of account\n${HOME}\nStatement date 01-06-2026\nTotal 1,20,000.00`, `Statement for ${HOME}`)
+  mail('HDFC Bank <cards@hdfcbank.example>', 'Your credit card statement', 'Card.pdf',
+    `Credit card statement\n${HOME}\nStatement date 01-06-2026\nPayment due date 20-06-2026\nTotal amount due Rs 18,250.00`, `Statement for ${HOME}`)
+  mail('Insurer <policy@insurer.example>', 'Your motor insurance policy', 'Motor_Policy.pdf',
+    `Policy schedule - motor insurance\n${HOME}\nPremium Rs 12,000\nPeriod of insurance 01-06-2026 to 31-05-2027`)
+  mail(ADANI, 'Planned power outage - CA No. 102401902', 'Outage.pdf', 'Supply will be off on 10-06-2026 for maintenance.')
+  mail(ADANI, 'Important information for CA No. 102401902', 'Info.pdf',
+    'Dear customer, we are upgrading our network in Malad West. Electricity supply may be interrupted.')
+  mail('Sai Dham CHS <secretary@society.example>', 'Notice of AGM - Sai Dham CHS', 'AGM.pdf', 'Annual general meeting on 20-06-2026')
+  mail('Sai Dham CHS <secretary@society.example>', 'Water supply timings - Sai Dham', 'Water.pdf',
+    'Sai Dham CHS: water supply will be from 6am to 9am from Monday.')
+  mail('Airtel <ebill@airtel.in>', 'Your Airtel postpaid bill', 'Airtel.pdf',
+    `Airtel postpaid bill\n${HOME}\nRelationship No 1234567890\nBill date 05-06-2026\nAmount payable Rs 599.00`)
+  mail('Mahanagar Gas <bills@mahanagargas.com>', 'Save on gas with MGL Connect', 'Promo.pdf',
+    'Download the MGL Connect app to pay online and track your gas consumption.')
+  mail('Croma <orders@croma.example>', 'Your invoice', 'Croma.pdf',
+    `Tax Invoice\nInvoice No 123\nInvoice date 03-06-2026\nTotal Rs 45,000.00\nShip to: ${HOME}`)
+  n.run('processBills()')
+  const filed = n.paths().filter((p) => !p.endsWith('Bill Sorter Settings'))
+  eq('none of them is filed', filed.length, 0)
+  ok('every one is logged as skipped', n.log().length === 10 && n.log().every((r) => r.Result === 'Skipped'),
+    JSON.stringify(n.log().map((r) => [r.Attachment, r.Result, r.Notes])))
+  const why = (name) => (n.log().find((r) => r.Attachment === name) || {}).Notes || ''
+  ok('a bank statement with your address: not a bill type it files', /Not one of the bill types/.test(why('Statement.pdf')), why('Statement.pdf'))
+  ok('a credit card statement with your address and a due date: not a bill type it files', /Not one of the bill types/.test(why('Card.pdf')), why('Card.pdf'))
+  ok('a car policy with your address: not home insurance', /Not one of the bill types/.test(why('Motor_Policy.pdf')), why('Motor_Policy.pdf'))
+  ok('an outage notice: a notice', /notice/.test(why('Outage.pdf')), why('Outage.pdf'))
+  ok('a notice that names your account but has no amount due: not a bill', /Doesn't read like a bill/.test(why('Info.pdf')), why('Info.pdf'))
+  ok('a society circular about water: not a bill', /Doesn't read like a bill/.test(why('Water.pdf')), why('Water.pdf'))
+  ok('your own mobile bill, matched only by your address: kept out', /only by address/.test(why('Airtel.pdf')), why('Airtel.pdf'))
+  ok('nothing lands in a Miscellaneous folder', !n.paths().some((p) => /Miscellaneous/.test(p)))
+  ok('or in Needs Review', !n.paths().some((p) => /_Needs Review/.test(p)))
+
+  // the same phone bill is filed once its account is put against a property
+  n.tab('Properties').rows[1][1] = '102401902, 210000800764, 1234567890'
+  n.thread({ from: 'Airtel <ebill@airtel.in>', subject: 'Your Airtel broadband bill', date: '2026-07-05T09:00:00+05:30', body: 'Attached.',
+    attachments: [pdf('Airtel_Jul.pdf', `Airtel broadband bill\n${HOME}\nRelationship No 1234567890\nBill date 05-07-2026\nAmount payable Rs 999.00`)] })
+  n.run('processBills()')
+  has('a phone or internet bill whose account is in the sheet is filed', n.paths(), P(ML, 'Internet & Telecom', 'FY 2026-27', '2026-06 June 2026 Internet & Phone Bill.pdf'))
+  const home = makeWorld()
+  home.thread({ from: 'Insurer <policy@insurer.example>', subject: 'Your home insurance policy', date: '2026-06-05T09:00:00+05:30', body: 'Attached.',
+    attachments: [pdf('Home_Policy.pdf', `Home insurance policy schedule\n${HOME}\nPremium Rs 4,000\nPolicy period 01-06-2026 to 31-05-2027`)] })
+  home.run('processBills()')
+  has('a home insurance policy for a property is filed', home.paths(), P(ML, 'Property Insurance', 'FY 2026-27', '2026-06 June 2026 Insurance.pdf'))
+}
+
 console.log('\n── STARTING OVER ──')
 {
   const o = makeWorld()
