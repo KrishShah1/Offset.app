@@ -1,0 +1,96 @@
+# Bill Sorter (Google Apps Script)
+
+Reads property bills in Gmail and files them in Google Drive by property, then utility, then
+financial year:
+
+```
+Property Bills/
+├── Bill Sorter Settings                       ← spreadsheet: Properties tab + Log tab
+├── 2, Mother's Love, (Malad West)/
+│   ├── Electricity Bills/
+│   │   └── FY 2026-27/
+│   │       ├── 2026-04 April 2026 Electricity Bill.pdf
+│   │       └── 2026-05 May 2026 Electricity Bill.pdf
+│   └── Property Taxes/…
+├── New property - Electricity 900012345678/   ← an account the sheet didn't know yet
+└── _Needs Review/                             ← bills it couldn't place
+```
+
+This is a standalone Google Apps Script. It runs in your Google account, not in the Offset app.
+
+## Setting it up
+
+Do this on a computer; the Apps Script editor is hard to use on a phone.
+
+1. Open your project at [script.google.com](https://script.google.com), or click **New project**.
+2. Replace everything in `Code.gs` with [`Code.gs`](./Code.gs) from this folder, and save.
+3. Next to **Services**, click **+**, choose **Drive API**, and click **Add**. Skip this if it's
+   already listed.
+4. **Project Settings** (the gear) → **Time zone** → *(GMT+05:30) India Standard Time*.
+5. Choose **setup** in the function list at the top and click **Run**. Approve the permissions it
+   asks for: Gmail, Drive, Docs, Sheets, and running on a schedule.
+
+`setup` creates the **Property Bills** folder and the **Bill Sorter Settings** spreadsheet,
+schedules a run every hour (replacing the old script's schedule) and sorts the first batch.
+It works back through older mail about 50 conversations per run. To stop it going back that far,
+set `SEARCH_SINCE` in `CONFIG`, e.g. `'2024/04/01'`.
+
+## Using it
+
+**Properties tab.** One row per property: its name (also its folder name), its account numbers,
+and keywords that appear on its bills (building, flat number, road). Change it any time; the
+next run picks it up.
+
+- **Rename a property** in the sheet or in Drive. The other one follows.
+- **New properties appear by themselves.** A bill with an account number the sheet doesn't know
+  gets a row like `New property - Electricity 123456789` and a folder of its own. Rename it. Or,
+  if that account belongs to a property you already have, move the number into that row, delete
+  the new row, and move its files across in Drive.
+- An account number always beats a keyword. Keywords match whole words only, so `f-34` matches
+  "F-34, Sej Plaza" but not "a bill of 3,450".
+
+**Log tab.** Every attachment it looked at, with a link to the file and the email, the month and
+financial year it chose and why, and what it matched on. The results:
+
+| Result | Meaning |
+|---|---|
+| Filed | In its property's folder |
+| Filed (new property) | Started a new property row and folder |
+| Needs review | In `_Needs Review`: no known account or keyword, or two properties matched equally |
+| Duplicate | The same file is already there |
+| Skipped | Not a property bill: shopping invoices, restaurant bills, terms and conditions |
+| Error | Something failed; it tries again next run, up to three times |
+
+**_Needs Review.** Move the file by hand, then add the account number or a keyword to the right
+property so the next one goes straight there.
+
+**To sort an email again**, delete its rows in the Log tab and remove the `Bill Sorter` label from
+it in Gmail. If its earlier copy is in the wrong folder, delete that.
+
+## How it decides
+
+- **Reading the bill.** Each PDF or photo is turned into a temporary Google Doc by Drive's OCR,
+  read, and deleted. If that fails it sorts from the email alone, and the log says so.
+- **Utility.** The sender, subject, bill and email are checked against the keywords for each type
+  in `UTILITIES` at the top of `Code.gs`; the strongest evidence wins.
+- **Month.** The "Bill Month" printed on the bill, else its billing period, a month in the subject,
+  the bill date, and finally the date the email arrived. Electricity, gas, water and phone bills
+  charge for the month before, so one dated in April that doesn't say which month it covers is
+  filed as March's. Society, rent, tax and insurance bills go under the month their period starts.
+- **Financial year.** April to March: March 2026 is `FY 2025-26`, April 2026 is `FY 2026-27`.
+- **File name.** `2026-04 April 2026 Electricity Bill.pdf`, month number first so a year lists in
+  order. A different bill for the same month gets ` (2)`; the same file twice is saved once.
+
+## Coming from the old script
+
+The old script wrote to `Sorted_Bills` and labelled threads `Bill Records`. This one uses a new
+folder and a new label on purpose: it re-sorts everything the old one handled, much of which went
+to the wrong place, without mixing with it. When you're happy with **Property Bills**, delete
+`Sorted_Bills` and the `Bill Records` label. Your three properties start in the sheet with the
+same names, account numbers and keywords as before.
+
+## Tests
+
+`node tests/logic/billsorter.test.mjs` runs `Code.gs` against stand-ins for Gmail, Drive, Docs and
+Sheets. It can't prove Google's own services behave as described; it proves the script's
+decisions, file names, retries and bookkeeping do.
