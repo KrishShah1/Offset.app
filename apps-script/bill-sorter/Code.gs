@@ -22,7 +22,7 @@
 
 const CONFIG = {
   BASE_FOLDER: 'Property Bills',         // top-level folder in My Drive
-  SETTINGS_FILE: 'Bill Sorter Settings', // spreadsheet with the Properties and Log tabs
+  SETTINGS_FILE: 'Bill Sorter Settings', // spreadsheet with the Properties, Log and Read text tabs
   LABEL: 'Bill Records',                 // put on each Gmail thread once it has been handled
   NEEDS_REVIEW: '_Needs Review',         // bills whose property couldn't be worked out
   TIME_ZONE: 'Asia/Kolkata',
@@ -553,7 +553,7 @@ function todayKey_() {
 
 // ─── One run ─────────────────────────────────────────────────────────────────
 
-// Works through the search 50 threads at a time until the time is up or nothing is left, then
+// Works through the search 100 threads at a time until the time is up or nothing is left, then
 // through conversations that already have the label, for emails Gmail labelled on arrival.
 function runBatch_() {
   const ctx = openContext_();
