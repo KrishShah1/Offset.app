@@ -5,7 +5,7 @@ financial year:
 
 ```
 Property Bills/
-├── Bill Sorter Settings                       ← spreadsheet: Properties tab + Log tab
+├── Bill Sorter Settings                       ← spreadsheet: Properties, Log and Read text tabs
 ├── 2, Mother's Love, (Malad West)/
 │   ├── Electricity Bills/
 │   │   └── FY 2026-27/
@@ -46,6 +46,12 @@ line of each run's log says either `All caught up.` or `More to do`.
   account numbers is filed straight away, and an email with nothing to suggest a property bill
   (a shopping invoice, say) is skipped without opening. Set `READ_ATTACHMENTS` to `'always'` to
   open every one: slower, but the bill month then always comes from the bill itself.
+- **Each file is opened once.** What Drive reads from it is kept in the **Read text** tab of the
+  settings spreadsheet, so looking at the same file again (a resend, **retrySkipped**, a new
+  version of the script, **checkEmails**, **startOver**, or a run that was cut off part way) takes
+  a moment instead of another OCR. A file that's already filed, arriving in another email, is
+  logged as a duplicate without being opened at all. Clearing the Read text tab does no harm:
+  files are just read again when next needed.
 - Files over 5 MB and PDFs over 10 pages are never opened; they're sorted from their email.
 - To clear a big backlog faster, run **processBills** by hand a few times. Each run takes up to
   about four minutes.

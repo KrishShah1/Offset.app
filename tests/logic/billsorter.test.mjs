@@ -156,7 +156,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
     const msg = { id: nextId('msg'), labels: new Set(), fetched: 0, ...m }
     return Object.assign(msg, {
       getId: () => msg.id, getDate: () => new Date(msg.date), getFrom: () => msg.from,
-      getSubject: () => msg.subject, getPlainBody: () => msg.body ?? '',
+      getSubject: () => msg.subject, getPlainBody: () => { msg.bodyReads = (msg.bodyReads || 0) + 1; return msg.body ?? '' },
       getAttachments: (opts = {}) => {
         msg.fetched++
         w.now += w.costs.fetch
@@ -187,13 +187,14 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
   const books = new Map()
   // Like Sheets: a new tab has 1000 rows, and a range past the last one is an error.
   const makeSheet = (name) => {
-    const s = { name, rows: [], notes: {}, maxRows: 1000 }
+    const s = { name, rows: [], notes: {}, maxRows: 1000, writes: 0 }
     const range = (r, c, nr = 1, nc = 1) => {
       if (r - 1 + nr > s.maxRows) throw new Error('The coordinates of the range are outside the dimensions of the sheet.')
       const rg = {
         getValues: () => Array.from({ length: nr }, (_, i) =>
           Array.from({ length: nc }, (_, j) => (s.rows[r - 1 + i] || [])[c - 1 + j] ?? '')),
         setValues: (vals) => {
+          s.writes++
           vals.forEach((row, i) => {
             const target = s.rows[r - 1 + i] || (s.rows[r - 1 + i] = [])
             row.forEach((v, j) => { target[c - 1 + j] = v })
@@ -201,6 +202,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
           return rg
         },
         setValue: (v) => rg.setValues([[v]]),
+        getValue: () => rg.getValues()[0][0],
         clearContent: () => rg.setValues(Array.from({ length: nr }, () => Array(nc).fill(''))),
         setFontWeight: () => rg, setNumberFormat: () => rg,
         setNote: (note) => { s.notes[`${r},${c}`] = note; return rg },
@@ -250,6 +252,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
   const PropertiesService = {
     getScriptProperties: () => ({
       getProperty: (k) => (store.has(k) ? store.get(k) : null),
+      getProperties: () => Object.fromEntries(store),
       setProperty: (k, v) => { store.set(k, String(v)) },
       setProperties: (o) => { Object.entries(o).forEach(([k, v]) => store.set(k, String(v))) },
       deleteProperty: (k) => { store.delete(k) },
@@ -764,6 +767,7 @@ ok('the email with three bills, stopped part way, finished as filed, not as dupl
 eq('and logged once each', slow.log().filter((r) => /^TPC_1[123]\.pdf$/.test(r.Attachment)).length, 3)
 ok('a run that stops says there is more to do', slow.logs.some((l) => /More to do/.test(l)))
 ok('and the triple email really was cut off once', triple.messages[0].fetched > 1, String(triple.messages[0].fetched))
+eq('yet each of the 12 attachments went through Drive\'s OCR only once', slow.ocrCalls, 12)
 
 const big = makeWorld()
 big.thread({ from: 'Tata Power <bills@tatapower.com>', subject: 'Your Tata Power bill', date: '2026-06-03T09:00:00+05:30', body: 'Attached.',
@@ -1112,6 +1116,50 @@ console.log('\n── LOOKING AGAIN AT WHAT WAS SKIPPED ──')
   ok('and nothing is left marked to look at again', ![...k.store.keys()].some((x) => x.startsWith('recheck:')))
 }
 
+console.log('\n── DOING EACH THING ONCE ──')
+{
+  const e = makeWorld()
+  fillMailbox(e)
+  e.run('processBills()')
+  const logTab = e.tab('Log')
+  ok('the Log tab is written once for the whole run, not once per email', logTab.writes <= 2, String(logTab.writes))
+  const read = e.read.length
+  const filedFirst = e.paths()
+  ok('what Drive read is kept in the Read text tab', e.tab('Read text').rows.length > 1)
+
+  // looking at everything again: a new version, then starting over
+  e.store.set('rules', 'an older version')
+  e.run('processBills()')
+  e.run('checkEmails()')
+  e.run('startOver()')
+  e.run('processBills()')
+  const again = e.read.slice(read)
+  ok('re-sorting, checking and starting over read no file a second time (only the unreadable scan is tried again)',
+    again.every((name) => name === 'Scan.pdf'), JSON.stringify(again))
+  eq('and sort the same way', JSON.stringify(e.paths()), JSON.stringify(filedFirst))
+
+  // the same PDF again, in an email that can't place it by itself
+  const before = e.ocrCalls
+  e.thread({ from: 'Me <me@example.com>', subject: 'Fwd: see attached', date: '2026-10-22T09:00:00+05:30', body: 'fyi',
+    attachments: [pdf('Bill_151759775.pdf', `Adani Electricity Mumbai Limited
+ELECTRICITY BILL
+CA No: 151759775
+Address: FLAT B-0202, SAI DHAM TOWERS, LALJI PADA, KANDIVALI WEST, MUMBAI 400067
+Bill Month: APR-2026   Bill Date: 30-04-2026   Due Date: 20-05-2026
+Units consumed 312 kWh   Energy charges 2,140.00
+Consumption history: Jan-26 210 Feb-26 190 Mar-26 250 Apr-26 312
+Amount payable Rs. 2,140.00`)] })
+  e.run('processBills()')
+  eq('a file that is already filed, sent again, is a duplicate', e.log().at(-1).Result, 'Duplicate')
+  eq('known without opening it', e.ocrCalls, before)
+
+  // an email with three attachments: its text is read once, not once per attachment
+  const three = e.thread({ from: 'Tata Power <bills@tatapower.com>', subject: 'Three bills', date: '2026-10-22T10:00:00+05:30', body: 'Attached.',
+    attachments: [1, 2, 3].map((n) => pdf(`T${n}.pdf`, `ELECTRICITY BILL\nConsumer No: 90001234567${n}\nBill Month: SEP-2026\nAmount payable ${n}00.00`)) })
+  e.run('processBills()')
+  eq('an email with three attachments has its text read once', three.messages[0].bodyReads, 1)
+}
+
 console.log('\n── STARTING OVER ──')
 {
   const o = makeWorld()
@@ -1147,7 +1195,7 @@ s.run('setup()')
 eq('setup leaves exactly one schedule', s.triggers.length, 1)
 eq('an hourly processBills', `${s.triggers[0].getHandlerFunction()} every ${s.triggers[0].hours}h`, 'processBills every 1h')
 has('and sorts the first batch straight away', s.paths(), P(ML, 'Electricity Bills', 'FY 2026-27', '2026-06 June 2026 Electricity Bill.pdf'))
-eq('the spreadsheet has just the two tabs', s.book().getSheets().map((x) => x.getName()).join(', '), 'Properties, Log')
+eq('the spreadsheet has its three tabs', s.book().getSheets().map((x) => x.getName()).join(', '), 'Properties, Log, Read text')
 ok('the old function name still works for an old trigger', typeof s.ctx.automateBillSorting === 'function')
 
 console.log('\n── "ALWAYS" OPENS EVERYTHING ──')

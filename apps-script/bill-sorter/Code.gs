@@ -344,9 +344,13 @@ function checkEmails() {
     });
     const logged = logRows_(ctx);
     messages.sort((a, b) => b.message.getDate() - a.message.getDate());
-    messages.slice(0, 5).forEach((m) => {
-      if (!past_(CONFIG.RUN_MINUTES)) checkMessage_(m.thread, m.message, ctx, searched, logged);
-    });
+    try {
+      messages.slice(0, 5).forEach((m) => {
+        if (!past_(CONFIG.RUN_MINUTES)) checkMessage_(m.thread, m.message, ctx, searched, logged);
+      });
+    } finally {
+      flush_(ctx); // what it read is kept, so the next run doesn't read it again
+    }
   } finally {
     if (ownClock) clock_.started = null;
   }
@@ -367,12 +371,13 @@ function checkMessage_(thread, message, ctx, searched, logged) {
   }
   lines.push('  Bill Records label: ' + label);
   const items = billAttachments_(message);
+  const email = emailTexts_(message);
   items.forEach((item) => {
     item.count = items.length;
     lines.push('  ' + item.name + ' (' + item.type + ', ' + Math.round(item.size / 1024) + ' KB)');
     const row = logged[message.getId() + ':' + item.hash];
     lines.push('    In the Log: ' + (row ? row.result + '.' + (row.notes ? ' ' + row.notes : '') : 'not there.'));
-    const j = judge_(message, item, ctx);
+    const j = judge_(email, item, ctx);
     if (!j) {
       lines.push('    Out of time before opening it; run checkEmails again.');
       return;
@@ -552,30 +557,34 @@ function todayKey_() {
 // through conversations that already have the label, for emails Gmail labelled on arrival.
 function runBatch_() {
   const ctx = openContext_();
-  resortAfterUpdate_(ctx);
-  const query = buildQuery_(ctx.properties);
-  const tried = {};
   const tally = {};
-  let start = 0;
   let finished = false;
-  while (!finished && !past_(CONFIG.RUN_MINUTES)) {
-    const page = GmailApp.search(query, start, 50);
-    if (!page.length) {
-      finished = true;
-      break;
+  try {
+    resortAfterUpdate_(ctx);
+    const query = buildQuery_(ctx.properties);
+    const tried = {};
+    let start = 0;
+    while (!finished && !past_(CONFIG.RUN_MINUTES)) {
+      const page = GmailApp.search(query, start, PAGE);
+      if (!page.length) {
+        finished = true;
+        break;
+      }
+      const fresh = page.filter((t) => !tried[t.getId()]);
+      if (!fresh.length) {
+        start += page.length; // threads tried this run that couldn't be labelled: look past them
+        continue;
+      }
+      for (let i = 0; i < fresh.length && !past_(CONFIG.RUN_MINUTES); i++) {
+        tried[fresh[i].getId()] = true;
+        if (processThread_(fresh[i], ctx, tally) === 'done') fresh[i].addLabel(ctx.label);
+      }
     }
-    const fresh = page.filter((t) => !tried[t.getId()]);
-    if (!fresh.length) {
-      start += page.length; // threads tried this run that couldn't be labelled: look past them
-      continue;
-    }
-    for (let i = 0; i < fresh.length && !past_(CONFIG.RUN_MINUTES); i++) {
-      tried[fresh[i].getId()] = true;
-      if (processThread_(fresh[i], ctx, tally) === 'done') fresh[i].addLabel(ctx.label);
-    }
+    if (!finished) finished = !GmailApp.search(query, 0, 1).length;
+    if (finished) finished = sweepLabelled_(ctx, tried, tally);
+  } finally {
+    flush_(ctx);
   }
-  if (!finished) finished = !GmailApp.search(query, 0, 1).length;
-  if (finished) finished = sweepLabelled_(ctx, tried, tally);
   const counts = Object.keys(tally).map((result) => tally[result] + ' ' + result.toLowerCase()).join(', ');
   console.log((counts || 'Nothing new') + ' in ' + Math.round(elapsedMs_() / 1000) + 's. ' +
     (finished ? 'All caught up.' : 'More to do; the next run carries on from here.'));
@@ -594,7 +603,9 @@ function buildQuery_(properties, labelledToo) {
     (CONFIG.SEARCH_SINCE ? ' after:' + CONFIG.SEARCH_SINCE : '');
 }
 
-const DAY = 24 * 60 * 60 * 1000;
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
+const PAGE = 100; // threads per Gmail search call
 
 // Today's date. Its own function so the tests can fix it.
 function today_() {
@@ -605,14 +616,14 @@ function today_() {
 // every bill under the same subject, so each new bill lands in an old conversation already
 // labelled and the search above never sees it. So conversations with the label are looked
 // through as well, for emails the Log doesn't have: from the last LOOK_BACK_DAYS the first time,
-// and after that from just before the previous look. Where it got to is kept, so a long first
-// look is spread over several runs. True when it got to the end.
+// and after that from a few hours before the previous look (mail can arrive late). Where it got
+// to is kept, so a long first look is spread over several runs. True when it got to the end.
 function sweepLabelled_(ctx, tried, tally) {
   const props = PropertiesService.getScriptProperties();
   if (!props.getProperty('sweepFrom')) {
     const last = Number(props.getProperty('sweptTo') || 0);
     props.setProperties({
-      sweepFrom: String(last ? last - 2 * DAY : today_().getTime() - CONFIG.LOOK_BACK_DAYS * DAY),
+      sweepFrom: String(last ? last - 6 * HOUR : today_().getTime() - CONFIG.LOOK_BACK_DAYS * DAY),
       sweepStarted: String(today_().getTime()),
       sweepAt: '0',
       sweepRetry: 'no',
@@ -621,12 +632,14 @@ function sweepLabelled_(ctx, tried, tally) {
   const from = Number(props.getProperty('sweepFrom'));
   let at = Number(props.getProperty('sweepAt') || 0);
   let retry = props.getProperty('sweepRetry') === 'yes';
+  // Gmail's after: takes a whole day in its own time zone, so ask from the day before; the exact
+  // time is applied to each email below.
   const query = buildQuery_(ctx.properties, true) + ' after:' +
-    Utilities.formatDate(new Date(from), CONFIG.TIME_ZONE, 'yyyy/MM/dd');
+    Utilities.formatDate(new Date(from - DAY), CONFIG.TIME_ZONE, 'yyyy/MM/dd');
   let finished = false;
   let stopped = false;
   while (!finished && !stopped && !past_(CONFIG.RUN_MINUTES)) {
-    const page = GmailApp.search(query, at, 50);
+    const page = GmailApp.search(query, at, PAGE);
     for (let i = 0; i < page.length; i++) {
       if (past_(CONFIG.RUN_MINUTES)) {
         stopped = true;
@@ -644,14 +657,14 @@ function sweepLabelled_(ctx, tried, tally) {
       }
       at++;
     }
-    if (page.length < 50 && !stopped) finished = true;
+    if (page.length < PAGE && !stopped) finished = true;
   }
   if (!finished) {
     props.setProperties({ sweepAt: String(at), sweepRetry: retry ? 'yes' : 'no' });
     return false;
   }
   // After an error the next look starts from the same place, so that email is tried again.
-  props.setProperty('sweptTo', String(retry ? from + 2 * DAY : Number(props.getProperty('sweepStarted'))));
+  props.setProperty('sweptTo', String(retry ? from + 6 * HOUR : Number(props.getProperty('sweepStarted'))));
   ['sweepFrom', 'sweepStarted', 'sweepAt', 'sweepRetry'].forEach((k) => props.deleteProperty(k));
   return true;
 }
@@ -671,18 +684,19 @@ function processThread_(thread, ctx, tally, since) {
     if (state === 'later') return 'later';
     if (state === 'failed') failed = true;
   }
-  if (failed) return giveUp_(thread) ? 'done' : 'retry';
-  clearAttempts_(thread);
+  if (failed) return giveUp_(thread, ctx) ? 'done' : 'retry';
+  clearAttempts_(thread, ctx);
   return 'done';
 }
 
-// One email, all or nothing: its log rows are written together at the end, so if time runs
+// One email, all or nothing: its log rows are kept together until it is finished, so if time runs
 // out part way the whole email is done again next run. Files it saved are recognised then.
 function processMessage_(message, thread, ctx, tally) {
   const items = billAttachments_(message);
   const rows = [];
   const results = [];
   let failed = false;
+  let email = null;
   for (let j = 0; j < items.length; j++) {
     const item = items[j];
     const key = message.getId() + ':' + item.hash;
@@ -690,7 +704,13 @@ function processMessage_(message, thread, ctx, tally) {
     item.count = items.length;
     let o;
     try {
-      o = handleAttachment_(message, item, ctx);
+      if (ctx.filed[item.hash]) {
+        // the very same file came in another email and is filed already: nothing to open
+        o = { result: 'Duplicate', url: ctx.filed[item.hash], notes: 'The very same file is already filed.' };
+      } else {
+        email = email || emailTexts_(message);
+        o = handleAttachment_(message, item, ctx, email);
+      }
     } catch (e) {
       console.log('Error on ' + item.name + ': ' + (e && e.stack ? e.stack : e));
       o = { result: 'Error', notes: String(e && e.message ? e.message : e) };
@@ -715,23 +735,26 @@ function processMessage_(message, thread, ctx, tally) {
   return failed ? 'failed' : 'ok';
 }
 
-function giveUp_(thread) {
+// Failed runs in a row for each thread are kept in the script's properties, and read once a run.
+function giveUp_(thread, ctx) {
+  const id = thread.getId();
+  const attempts = (ctx.attempts[id] || 0) + 1;
   const props = PropertiesService.getScriptProperties();
-  const key = 'attempts:' + thread.getId();
-  const attempts = Number(props.getProperty(key) || 0) + 1;
   if (attempts >= CONFIG.MAX_ATTEMPTS) {
-    props.deleteProperty(key);
+    props.deleteProperty('attempts:' + id);
+    delete ctx.attempts[id];
     return true;
   }
-  props.setProperty(key, String(attempts));
+  props.setProperty('attempts:' + id, String(attempts));
+  ctx.attempts[id] = attempts;
   return false;
 }
 
-function clearAttempts_(thread) {
-  const props = PropertiesService.getScriptProperties();
-  const key = 'attempts:' + thread.getId();
-  if (props.getProperty(key)) props.deleteProperty(key);
-  return true;
+function clearAttempts_(thread, ctx) {
+  const id = thread.getId();
+  if (!ctx.attempts[id]) return;
+  PropertiesService.getScriptProperties().deleteProperty('attempts:' + id);
+  delete ctx.attempts[id];
 }
 
 // The PDF and image attachments worth reading. Inline images (logos, banners, signatures)
@@ -769,8 +792,8 @@ function billType_(contentType, name) {
 
 // Sorts one attachment. Returns null when it needs opening but the run is too close to its time
 // limit to start, so it waits for next run.
-function handleAttachment_(message, item, ctx) {
-  const j = judge_(message, item, ctx);
+function handleAttachment_(message, item, ctx, email) {
+  const j = judge_(email, item, ctx);
   if (!j) return null;
   const v = j.v;
   const blob = j.blob;
@@ -784,7 +807,7 @@ function handleAttachment_(message, item, ctx) {
   };
   if (v.action === 'skip') return Object.assign(outcome, { result: 'Skipped' });
 
-  const same = sameBill_(ctx, v, message.getDate());
+  const same = sameBill_(ctx, v, email.date);
   if (same) {
     return Object.assign(outcome, {
       result: 'Duplicate',
@@ -794,7 +817,7 @@ function handleAttachment_(message, item, ctx) {
     });
   }
 
-  placeGuess_(ctx, v, message.getDate());
+  placeGuess_(ctx, v, email.date);
   if (v.moved) outcome.month = MONTHS[v.month.m] + ' ' + v.month.y + ' (' + v.month.how + ', moved past another bill)';
   outcome.fy = v.fy;
 
@@ -810,7 +833,7 @@ function handleAttachment_(message, item, ctx) {
   const saved = saveFile_(ctx, target, blob, v.fileBase, extension_(item), item.hash, message.getId(), altBase,
     Boolean(property));
   const propertyName = property ? property.name : CONFIG.NEEDS_REVIEW;
-  if (!saved.duplicate) rememberBill_(ctx, v, propertyName, message.getDate(), saved.url);
+  if (!saved.duplicate) rememberBill_(ctx, v, propertyName, email.date, saved.url);
   let result = 'Filed';
   if (v.action === 'new') result = 'Filed (new property)';
   if (v.action === 'review') result = 'Needs review';
@@ -825,30 +848,29 @@ function handleAttachment_(message, item, ctx) {
 
 // What to do with one attachment, opening it only if the email alone isn't enough. Returns null
 // when it needs opening but the run is too close to its time limit to start.
-function judge_(message, item, ctx) {
+function judge_(email, item, ctx) {
   const blob = item.attachment.copyBlob().setContentType(item.type);
-  const texts = textsFor_(message, item, '');
-  let v = classify_(texts, ctx.properties, message.getDate());
+  const texts = textsFor_(email, item);
+  let v = classify_(texts, ctx.properties, email.date);
   let note = '';
   if (wantsReading_(v, texts, item, ctx)) {
     const tooMuch = tooMuchToRead_(blob, item);
     if (tooMuch) {
       note = 'Not opened (' + tooMuch + '), so this is based on the email.';
-    } else if (past_(CONFIG.READ_CUTOFF_MINUTES)) {
-      return null;
     } else {
-      const read = readText_(blob, item.name);
+      const read = readOnce_(ctx, blob, item);
+      if (!read) return null;
       if (read.error) {
         note = "Couldn't read the attachment itself (" + read.error + '), so this is based on the email.';
       } else {
-        texts.doc = normalize_(read.text).slice(0, 30000); // a bill's details are on its first pages
+        texts.doc = read.text;
         if (texts.doc.length < 40) {
           note = 'Drive read almost no text from the attachment, so this is based on the email.';
         }
       }
     }
     texts.unread = texts.doc.length < 40;
-    v = classify_(texts, ctx.properties, message.getDate());
+    v = classify_(texts, ctx.properties, email.date);
   }
   return { blob: blob, texts: texts, v: v, note: note };
 }
@@ -887,12 +909,23 @@ function pdfPages_(blob) {
   return found ? found.length : 0;
 }
 
-function textsFor_(message, item, docText) {
+// What the email says, read once for all of its attachments.
+function emailTexts_(message) {
   return {
-    doc: normalize_(docText),
+    date: message.getDate(),
     subject: normalize_(message.getSubject()),
     body: normalize_(String(message.getPlainBody() || '').slice(0, 20000)),
     from: normalize_(message.getFrom()),
+  };
+}
+
+// The texts classify_ weighs for one attachment: the email's, its file name, and later its own.
+function textsFor_(email, item) {
+  return {
+    doc: '',
+    subject: email.subject,
+    body: email.body,
+    from: email.from,
     file: normalize_(item.name.replace(/\.[a-z0-9]{2,4}$/i, '').replace(/_+/g, ' ')),
     photo: item.type.indexOf('image/') === 0,
     unread: false, // set when the attachment was too big to open or couldn't be read
@@ -906,6 +939,35 @@ function extension_(item) {
 }
 
 // ─── Reading the attachment ──────────────────────────────────────────────────
+
+// The attachment's text. Drive's OCR is the slow part, so each file is read once: its text is
+// kept in the Read text tab under its fingerprint, and looking at the same file again (a resend,
+// retrySkipped, a new version, checkEmails, a run cut off part way) takes a moment. Null when
+// it hasn't been read before and the run is too near its time limit to read it now.
+function readOnce_(ctx, blob, item) {
+  if (ctx.newTexts[item.hash] !== undefined) return { text: ctx.newTexts[item.hash], error: '' };
+  const row = textRows_(ctx)[item.hash];
+  if (row) return { text: String(ctx.textSheet.getRange(row, 2).getValue()), error: '' };
+  if (past_(CONFIG.READ_CUTOFF_MINUTES)) return null;
+  const read = readText_(blob, item.name);
+  const text = normalize_(read.text).slice(0, 30000); // a bill's details are on its first pages
+  if (!read.error && text.length >= 40) ctx.newTexts[item.hash] = text;
+  return { text: text, error: read.error };
+}
+
+// Where each kept text is in the Read text tab, by fingerprint; read the first time it's needed.
+function textRows_(ctx) {
+  if (!ctx.textRows) {
+    ctx.textRows = {};
+    const last = ctx.textSheet.getLastRow();
+    if (last > 1) {
+      ctx.textSheet.getRange(2, 1, last - 1, 1).getValues().forEach((r, i) => {
+        ctx.textRows[String(r[0])] = i + 2;
+      });
+    }
+  }
+  return ctx.textRows;
+}
 
 // Drive turns the PDF or photo into a temporary Google Doc, reading the text with OCR, and
 // the Doc is deleted straight after. Works for scanned bills and for PDFs with real text.
@@ -1135,25 +1197,24 @@ function matchProperty_(t, properties) {
     let score = 0;
     const why = [];
     const found = [];
-    p.accounts.forEach((account) => {
-      const re = numberRegex_(account);
+    const patterns = propertyPatterns_(p);
+    patterns.accounts.forEach((a) => {
+      const re = a.re;
       const w = re.test(t.doc) || re.test(t.file) ? 100 : re.test(t.subject) ? 80 : re.test(t.body) ? 50 : 0;
       if (w) {
         score += w;
-        why.push('account ' + account);
-        found.push({ account: account, w: w });
+        why.push('account ' + a.account);
+        found.push({ account: a.account, w: w });
       }
     });
     const seen = {};
-    p.keywords.forEach((keyword) => {
-      const key = keyword.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const re = phraseRegex_(keyword);
-      if (!re || seen[key]) return;
-      const w = re.test(strong) ? 10 : re.test(t.body) ? 5 : 0;
+    patterns.keywords.forEach((k) => {
+      if (seen[k.key]) return;
+      const w = k.re.test(strong) ? 10 : k.re.test(t.body) ? 5 : 0;
       if (w) {
-        seen[key] = true;
+        seen[k.key] = true;
         score += w;
-        why.push('"' + keyword + '"');
+        why.push('"' + k.keyword + '"');
       }
     });
     const accounts = found.sort((a, b) => b.w - a.w).map((x) => x.account);
@@ -1165,6 +1226,19 @@ function matchProperty_(t, properties) {
     return { property: null, score: 0, accounts: [], ambiguous: [scored[0].property.name, scored[1].property.name] };
   }
   return scored[0];
+}
+
+// A property's account numbers and keywords as patterns, made once and kept on the property.
+function propertyPatterns_(p) {
+  if (!p.patterns) {
+    p.patterns = {
+      accounts: p.accounts.map((account) => ({ account: account, re: numberRegex_(account) })),
+      keywords: p.keywords.map((keyword) => ({
+        keyword: keyword, key: keyword.toLowerCase().replace(/[^a-z0-9]/g, ''), re: phraseRegex_(keyword),
+      })).filter((k) => k.re),
+    };
+  }
+  return p.patterns;
 }
 
 // "Mother's Love" matches "mothers love", "MOTHER S LOVE" and "Mother’s-Love", but a phrase never
@@ -1456,6 +1530,9 @@ function openContext_() {
     settings: settings,
     propertySheet: propertiesTab_(settings),
     logSheet: logTab_(settings),
+    textSheet: textTab_(settings),
+    pending: [], // Log rows not written yet
+    newTexts: {}, // attachment texts not kept yet, by fingerprint
     label: GmailApp.getUserLabelByName(CONFIG.LABEL) || GmailApp.createLabel(CONFIG.LABEL),
     me: myAddress_(),
     folders: {},
@@ -1470,7 +1547,10 @@ function openContext_() {
 function remember_(ctx) {
   Object.assign(ctx, loadMemory_(ctx.logSheet));
   ctx.recheck = {};
-  PropertiesService.getScriptProperties().getKeys().forEach((k) => {
+  ctx.attempts = {};
+  const saved = PropertiesService.getScriptProperties().getProperties();
+  Object.keys(saved).forEach((k) => {
+    if (k.indexOf('attempts:') === 0) ctx.attempts[k.slice(9)] = Number(saved[k]);
     if (k.indexOf('recheck:') !== 0) return;
     ctx.recheck[k.slice(8)] = true;
     ctx.doneMessages.delete(k.slice(8));
@@ -1515,6 +1595,7 @@ function settingsSpreadsheet_(props, base) {
   const blank = ss.getSheets()[0];
   propertiesTab_(ss);
   logTab_(ss);
+  textTab_(ss);
   ss.deleteSheet(blank);
   DriveApp.getFileById(ss.getId()).moveTo(base);
   props.setProperty('SETTINGS_ID', ss.getId());
@@ -1551,6 +1632,18 @@ function logTab_(ss) {
     const letter = (name) => String.fromCharCode(65 + LOG_HEADERS.indexOf(name));
     sheet.getRange(letter('Account') + ':' + letter('Bill no')).setNumberFormat('@');
   }
+  return sheet;
+}
+
+// What Drive's OCR read from each attachment, kept so no file is read twice. Clearing it does no
+// harm: files are then read again when they are next looked at.
+function textTab_(ss) {
+  let sheet = ss.getSheetByName('Read text');
+  if (sheet) return sheet;
+  sheet = ss.insertSheet('Read text');
+  sheet.getRange(1, 1, 1, 2).setValues([['Fingerprint', 'Text read from the attachment']]).setFontWeight('bold');
+  sheet.getRange('B:B').setNumberFormat('@');
+  sheet.setFrozenRows(1);
   return sheet;
 }
 
@@ -1854,14 +1947,36 @@ function logValues_(thread, message, item, o, key) {
   ];
 }
 
+// An email's Log rows wait to be written with the rest of the run's, in one go.
 function writeLog_(ctx, rows) {
-  if (!rows.length) return;
-  const sheet = ctx.logSheet;
+  rows.forEach((row) => ctx.pending.push(row));
+  if (ctx.pending.length >= 50) flush_(ctx);
+}
+
+// Writes the Log rows and read texts that are waiting.
+function flush_(ctx) {
+  if (ctx.pending.length) {
+    appendRows_(ctx.logSheet, ctx.pending, LOG_HEADERS.length);
+    ctx.pending = [];
+  }
+  const hashes = Object.keys(ctx.newTexts);
+  if (hashes.length) {
+    const rows = textRows_(ctx);
+    const first = ctx.textSheet.getLastRow() + 1;
+    appendRows_(ctx.textSheet, hashes.map((hash) => [hash, cell_(ctx.newTexts[hash])]), 2);
+    hashes.forEach((hash, i) => {
+      rows[hash] = first + i;
+    });
+    ctx.newTexts = {};
+  }
+}
+
+function appendRows_(sheet, rows, width) {
   const first = sheet.getLastRow() + 1;
   // A new tab has 1000 rows and writing past the last one fails, so room is added first.
   const short = first + rows.length - 1 - sheet.getMaxRows();
   if (short > 0) sheet.insertRowsAfter(sheet.getMaxRows(), Math.max(short, 500));
-  sheet.getRange(first, 1, rows.length, LOG_HEADERS.length).setValues(rows);
+  sheet.getRange(first, 1, rows.length, width).setValues(rows);
 }
 
 // Sheets would run text that starts like a formula; an apostrophe in front keeps it as text.
