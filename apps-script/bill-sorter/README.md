@@ -82,7 +82,7 @@ financial year it chose and why, and what it matched on. The results:
 | Filed (new property) | Started a new property row and folder |
 | Needs review | In `_Needs Review`: no known account or keyword, or two properties matched equally |
 | Duplicate | Already filed: the same file, or the same bill sent again (same bill number, or same account and month) |
-| Skipped | Not a property bill: see below. Run **retrySkipped** to have these looked at again |
+| Skipped | Not a property bill: see below. **retrySkipped** has these looked at again |
 | Error | Something failed; it tries again next run, up to three times |
 
 **_Needs Review.** Move the file by hand, then add the account number or a keyword to the right
@@ -117,10 +117,19 @@ Every attachment it skips is in the Log tab with the reason in the Notes column.
 picks them up, whether they already have the `Bill Records` label, what the Log tab says, what Drive
 could read from each attachment, and where it would go now. It files and changes nothing.
 
-**If a bill was skipped that shouldn't have been,** fix the reason (usually: add its account
-number or a keyword to the property's row), then choose **retrySkipped** in the function list and
-click **Run**. It takes every Skipped row out of the Log and the `Bill Records` label off those
-emails, and the next run looks at them again. Bills already filed are left alone.
+**If a bill was skipped or left in `_Needs Review` that shouldn't have been,** fix the reason
+(usually: add its account number or a keyword to the property's row), then choose
+**retrySkipped** in the function list and click **Run**. It takes every Skipped and Needs review
+row out of the Log and the `Bill Records` label off those emails, and the next run looks at them
+again; a bill that can now be placed is moved out of `_Needs Review` to its property. Bills already
+filed are left alone. The first run after you paste in a new version of the script does this by
+itself.
+
+**Emails that arrive already labelled.** Gmail gives a conversation's labels to every email that
+arrives in it later. MGL sends every bill under the same subject, so Gmail puts them all in one
+conversation and each new bill arrives with the `Bill Records` label already on it. So besides
+unlabelled mail, each run also looks through labelled conversations for emails from the last
+`LOOK_BACK_DAYS` (365) that aren't in the Log yet. The first time, that can take a few runs.
 
 ## Duplicates
 
@@ -141,8 +150,9 @@ the script filed to the Drive trash (restorable there for 30 days), empties the 
 the `Bill Records` label off the emails it handled; the next runs sort them all again. Emails the
 old script labelled, and files you added yourself, are left alone.
 
-**To sort an email again**, delete its rows in the Log tab and remove the `Bill Records` label from
-it in Gmail. If its earlier copy is in the wrong folder, delete that.
+**To sort an email again**, delete its rows in the Log tab, and if it is more than a year old,
+remove the `Bill Records` label from it in Gmail. If its earlier copy is in the wrong folder,
+delete that.
 
 ## How it decides
 
@@ -162,10 +172,11 @@ it in Gmail. If its earlier copy is in the wrong folder, delete that.
 ## Coming from the old script
 
 The old script wrote to `Sorted_Bills` and labelled threads `Bill Records`. This one keeps the
-`Bill Records` label, so mail the old script already labelled is left alone, and new bills go to
-**Property Bills**. To have old mail sorted again, remove its `Bill Records` label: in Gmail on a
-computer, search `label:bill-records`, select all conversations, and remove the label. Your three
-properties start in the sheet with the same names, account numbers and keywords as before.
+`Bill Records` label, and new bills go to **Property Bills**. Mail from the last year that isn't in
+this script's Log is sorted even if the old script labelled it; older mail it labelled is left
+alone. To have that sorted too, remove its `Bill Records` label: in Gmail on a computer, search
+`label:bill-records`, select all conversations, and remove the label. Your three properties start
+in the sheet with the same names, account numbers and keywords as before.
 
 ## Tests
 

@@ -39,6 +39,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
       setTrashed: (v) => { n.trashed = v; return n },
       getDescription: () => n.description, setDescription: (v) => { n.description = v; return n },
       moveTo: (folder) => { n.parent = folder; return n },
+      getParents: () => iter([n.parent]),
     })
     if (kind === 'folder') Object.assign(n, {
       getFoldersByName: (v) => iter(kids(n).filter((x) => x.kind === 'folder' && x.name === v && !x.trashed)),
@@ -132,14 +133,16 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
     },
     getThreadById: (id) => threads.find((t) => t.id === id) || null,
     // Gmail matches messages, so a thread comes back while any message in it lacks the label.
-    // Of the rest of a query only from: is honoured (from:me aside); the word list matches anything.
+    // Of the rest of a query only from: (from:me aside) and after: are honoured; the word list
+    // matches anything.
     search: (query, start, max) => {
       w.queries.push(query)
       const senders = [...query.matchAll(/(?:^|[\s(])from:([^\s()]+)/g)].map((x) => x[1].toLowerCase()).filter((x) => x !== 'me')
-      return threads
-        .filter((t) => !/-label:/.test(query) || t.messages.some((m) => !m.labels.has(w.label)))
-        .filter((t) => !senders.length || t.messages.some((m) => senders.some((x) => m.from.toLowerCase().includes(x))))
-        .slice(start, start + max)
+      const after = Math.max(0, ...[...query.matchAll(/after:(\d{4})\/(\d{2})\/(\d{2})/g)]
+        .map((x) => new Date(`${x[1]}-${x[2]}-${x[3]}T00:00:00+05:30`).getTime()))
+      const matches = (m) => (!/-label:/.test(query) || !m.labels.has(w.label)) &&
+        (!senders.length || senders.some((x) => m.from.toLowerCase().includes(x))) && new Date(m.date).getTime() >= after
+      return threads.filter((t) => t.messages.some(matches)).slice(start, start + max)
     },
   }
   const attachment = (a) => ({
@@ -168,7 +171,13 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
       getLabels: () => [...new Set(t.messages.flatMap((m) => [...m.labels]))].map((n) => ({ getName: () => n })),
       getPermalink: () => `https://mail.google.com/mail/#all/${t.id}`,
       addLabel: (l) => { t.messages.forEach((m) => m.labels.add(l.getName())); return t },
-      receive: (m) => { t.messages.push(message(m)); return t },
+      // Gmail gives an email arriving in a conversation the labels the conversation already has.
+      receive: (m) => {
+        const labels = new Set(t.messages.flatMap((x) => [...x.labels]))
+        t.messages.push(Object.assign(message(m), {}))
+        labels.forEach((l) => t.messages.at(-1).labels.add(l))
+        return t
+      },
     })
     threads.push(t)
     return t
@@ -265,6 +274,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
         .formatToParts(date).map((x) => [x.type, x.value]))
       if (fmt === 'yyyy-MM') return `${p.year}-${p.month}`
       if (fmt === 'yyyy-MM-dd') return `${p.year}-${p.month}-${p.day}`
+      if (fmt === 'yyyy/MM/dd') return `${p.year}/${p.month}/${p.day}`
       if (fmt === 'd MMM yyyy') return `${Number(p.day)} ${MON3[Number(p.month) - 1]} ${p.year}`
       throw new Error('Utilities.formatDate not mocked for ' + fmt)
     },
@@ -282,6 +292,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
   const ctx = vm.createContext(sandbox)
   vm.runInContext('Date.now = function () { return __now(); };', ctx)
   vm.runInContext(CODE, ctx)
+  vm.runInContext('today_ = function () { return new Date("2026-10-21T12:00:00+05:30"); };', ctx) // a fixed today
   w.label = vm.runInContext('CONFIG.LABEL', ctx)
 
   Object.assign(w, {
@@ -432,11 +443,11 @@ Amount payable 2,500.00`)],
     from: 'Someone <someone@example.com>', subject: 'bill', date: '2026-06-16T09:00:00+05:30', body: 'hi',
     attachments: [{ name: 'logo.png', type: 'image/png', size: 4 * 1024, text: 'logo' }],
   })
-  // Already handled by the old script, which used the same label.
+  // Already handled by the old script, which used the same label, more than a year ago.
   t.oldScript = w.thread({
-    from: ADANI, subject: 'Adani Electricity Bill for CA No. 102401902', date: '2026-03-04T09:00:00+05:30',
+    from: ADANI, subject: 'Adani Electricity Bill for CA No. 102401902', date: '2025-03-04T09:00:00+05:30',
     body: 'Please find attached your bill.',
-    attachments: [pdf('Old_Bill.pdf', 'Adani Electricity\nCA No: 102401902\nBill Month: FEB-2026\nAmount payable 1,500.00')],
+    attachments: [pdf('Old_Bill.pdf', 'Adani Electricity\nCA No: 102401902\nBill Month: FEB-2025\nAmount payable 1,500.00')],
   })
   t.oldScript.addLabel({ getName: () => 'Bill Records' })
   return t
@@ -588,7 +599,7 @@ eq('the gas bill needs review', row('MGL.pdf').Result, 'Needs review')
 ok('the unreadable scan says so in the notes', /Couldn't read the attachment/.test(row('Scan.pdf').Notes), row('Scan.pdf').Notes)
 ok('the banner never reached the log', !row('banner.png').Result)
 ok('nor the logo', !row('logo.png').Result)
-ok('mail the old script already labelled "Bill Records" is left alone', !row('Old_Bill.pdf').Result)
+ok('mail from over a year ago already labelled "Bill Records" is left alone', !row('Old_Bill.pdf').Result)
 ok('each row links to its email', /^https:\/\/mail\.google\.com\//.test(row('MGL.pdf').Email))
 ok('and to its file in Drive', /^https:\/\/drive\.google\.com\//.test(row('MGL.pdf')['Drive file']))
 
@@ -633,15 +644,17 @@ eq('a second run files nothing new', w.paths().length, 14)
 eq('reads nothing again', w.ocrCalls, ocrBefore)
 eq('and logs nothing again', w.log().length, 16)
 
+// it arrives already labelled, as Gmail labels new emails in a labelled conversation
 mail.adaniApril.receive({
-  from: ADANI, subject: 'Adani Electricity Bill for CA No. 151759775', date: '2026-08-04T09:00:00+05:30',
+  from: ADANI, subject: 'Adani Electricity Bill for CA No. 151759775', date: '2026-10-22T09:00:00+05:30',
   body: 'Please find attached your bill.',
   attachments: [pdf('Bill_151759775.pdf', 'Adani Electricity\nCA No: 151759775\nBill Month: JUL-2026\nAmount payable 2,300.00')],
 })
 const oldMessage = mail.adaniApril.messages[0]
 const fetchedBefore = oldMessage.fetched
 w.run('processBills()')
-has('a new bill arriving in an old thread is filed', w.paths(), P(SD, 'Electricity Bills', 'FY 2026-27', '2026-07 July 2026 Electricity Bill.pdf'))
+ok('(Gmail labelled it on arrival)', mail.adaniApril.messages.at(-1).labels.has(w.label))
+has('a new bill arriving in an old, labelled thread is filed', w.paths(), P(SD, 'Electricity Bills', 'FY 2026-27', '2026-07 July 2026 Electricity Bill.pdf'))
 eq('the earlier email in that thread isn\'t downloaded again', oldMessage.fetched, fetchedBefore)
 eq('one new log row', w.log().length, 17)
 
@@ -1018,10 +1031,58 @@ SALE OF NATURAL GAS\nGas Consumption SCM (Standard cubic meter) 52.00\nMeter Rea
   ok('what the Log says about it', /In the Log: Filed/.test(out), out)
   ok('what it read from the PDF', /Opened: yes, \d+ characters read: "tax invoice mahanagar gas/.test(out), out)
   ok('and where it would go now', /Now it would be filed in 2, Mother's Love, \(Malad West\) \/ Gas Bills \/ FY 2026-27/.test(out), out)
-  ok('an email labelled by something else is called out', /not in the Log, so something else labelled it/.test(out), out)
+  ok('an email Gmail labelled before the script saw it is called out', /not in the Log yet, so the next run sorts it anyway/.test(out), out)
   ok('an unreadable PDF says so', /Opened: Couldn't read the attachment itself/.test(out), out)
   eq('nothing is filed', g.paths().length, filesBefore)
   eq('or logged', g.log().length, logBefore)
+  g.run('processBills()')
+  has('and the next run does sort it', g.paths(), P(ML, 'Gas Bills', 'FY 2026-27', '2027-03 March 2027 Gas Bill.pdf'))
+
+  // Gmail puts every MGL bill in one conversation, so each new one arrives already labelled
+  const conv = makeWorld()
+  const first = conv.thread({ from: MGL, subject: 'PNG Bill', date: '2026-07-22T13:13:00+05:30', body: BODY,
+    attachments: [pdf("Ebill_JUL'26.pdf", bill('22/05/2026 to 22/07/2026', '22/07/2026', '2106005202607'))] })
+  conv.run('processBills()')
+  first.receive({ from: MGL, subject: 'PNG Bill', date: '2026-10-23T13:13:00+05:30', body: BODY,
+    attachments: [pdf("Ebill_OCT'26.pdf", bill('22/08/2026 to 22/10/2026', '22/10/2026', '2106005202610'))] })
+  ok('a new MGL bill arrives with the label already on it', first.messages[1].labels.has(conv.label))
+  conv.run('processBills()')
+  has('and is filed all the same', conv.paths(), P(ML, 'Gas Bills', 'FY 2026-27', '2026-10 October 2026 Gas Bill.pdf'))
+  conv.run('processBills()')
+  eq('once', conv.log().length, 2)
+
+  // a labelled conversation from the old script, with bills from the last year it never saw
+  const old = makeWorld()
+  const t = old.thread({ from: MGL, subject: 'PNG Bill', date: '2025-07-22T13:13:00+05:30', body: BODY,
+    attachments: [pdf("Ebill_JUL'25.pdf", bill('22/05/2025 to 22/07/2025', '22/07/2025', '2106005202507'))] })
+  t.addLabel({ getName: () => 'Bill Records' })
+  t.receive({ from: MGL, subject: 'PNG Bill', date: '2026-09-22T13:13:00+05:30', body: BODY,
+    attachments: [pdf("Ebill_SEP'26.pdf", bill('22/07/2026 to 22/09/2026', '22/09/2026', '2106005202609'))] })
+  old.run('processBills()')
+  has('the September bill, labelled before the script ever ran, is found and filed', old.paths(),
+    P(ML, 'Gas Bills', 'FY 2026-27', '2026-09 September 2026 Gas Bill.pdf'))
+  ok('the one from over a year ago is left alone', !old.log().some((r) => r.Attachment === "Ebill_JUL'25.pdf"))
+}
+
+console.log('\n── A NEW VERSION LOOKS AGAIN AT WHAT IT COULDN\'T PLACE ──')
+{
+  const MGL = 'pngbill@mahanagargas.com'
+  const u = makeWorld()
+  const t = u.thread({ from: MGL, subject: 'PNG Bill', date: '2026-09-22T13:13:00+05:30', body: 'Please find the PNG bill.',
+    attachments: [pdf("Ebill_SEP'26.pdf", '', { unreadable: true })] })
+  u.run('processBills()')
+  eq('an unreadable MGL bill first goes to Needs Review', u.log()[0].Result, 'Needs review')
+  has('there', u.paths(), P('_Needs Review', 'Gas Bills', 'FY 2026-27', '2026-08 August 2026 Gas Bill.pdf'))
+  // then MGL's address is added to the property, and a new version of the script is pasted in
+  u.tab('Properties').rows[1][2] += ', mahanagargas.com'
+  u.store.set('rules', 'an older version')
+  u.run('processBills()')
+  eq('the next run looks at it again and files it', u.log().map((r) => r.Result).join(), 'Filed')
+  has('moving the file to its property', u.paths(), P(ML, 'Gas Bills', 'FY 2026-27', '2026-08 August 2026 Gas Bill.pdf'))
+  ok('rather than copying it', !u.paths().some((p) => p.includes('_Needs Review') && p.endsWith('.pdf')), JSON.stringify(u.paths()))
+  ok('and its email is labelled again', t.messages[0].labels.has(u.label))
+  u.run('processBills()')
+  eq('it happens once per version', u.log().length, 1)
 }
 
 console.log('\n── LOOKING AGAIN AT WHAT WAS SKIPPED ──')

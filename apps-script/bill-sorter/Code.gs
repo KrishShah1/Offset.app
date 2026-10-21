@@ -64,6 +64,9 @@ const CONFIG = {
     'minimum amount due', 'credit limit', 'order id', 'sold by', 'ship to', 'shipping address', 'chassis',
     'odometer'],
   SAME_BILL_DAYS: 7,                     // two copies of one account's bill this close together are one bill
+  // Gmail gives a conversation's label to emails that arrive in it later, so an email from this far
+  // back that isn't in the Log is sorted even though it already has the Bill Records label.
+  LOOK_BACK_DAYS: 365,
   // What checkEmails looks at: a Gmail search for emails you expected to see filed.
   CHECK_SEARCH: 'from:mahanagargas.com',
 };
@@ -187,6 +190,10 @@ const OTHER = {
   recurring: false, senders: [], keywords: [],
 };
 
+// Changed when a new version sorts differently: the first run after you paste it in looks again
+// at everything that was skipped or left in _Needs Review, as retrySkipped does.
+const RULES = '2026-10-21';
+
 // ─── Run these ───────────────────────────────────────────────────────────────
 
 /**
@@ -259,7 +266,7 @@ function startOver() {
     }
     const props = PropertiesService.getScriptProperties();
     props.getKeys().forEach((k) => {
-      if (k.indexOf('attempts:') === 0 || k.indexOf('recheck:') === 0) props.deleteProperty(k);
+      if (/^(attempts:|recheck:|sweep)/.test(k) || k === 'sweptTo') props.deleteProperty(k);
     });
     console.log('Cleared. ' + forgot.threads + ' emails will be sorted again, starting with the next run ' +
       '(or run processBills now).');
@@ -269,22 +276,47 @@ function startOver() {
 }
 
 /**
- * Run by hand to have everything the Log shows as Skipped looked at again, for instance after
- * changing the code or adding an account number or keyword to a property. Bills already filed
- * stay where they are. If it runs out of time it says so: run it again to finish.
+ * Run by hand to have everything the Log shows as Skipped or Needs review looked at again, for
+ * instance after adding an account number or keyword to a property. A bill in _Needs Review that
+ * can now be placed is moved to its property. Bills already filed stay where they are. If it runs
+ * out of time it says so: run it again to finish.
  */
 function retrySkipped() {
   const ownClock = startClock_();
   try {
     const ctx = openContext_();
-    const result = LOG_HEADERS.indexOf('Result');
-    const forgot = forgetRows_(ctx, (row) => String(row[result]) === 'Skipped');
-    console.log(forgot.rows + ' skipped attachments in ' + forgot.threads + ' emails will be looked at again, ' +
-      'starting with the next run (or run processBills now).' +
+    const forgot = forgetRows_(ctx, unplaced_(new Date().getTime()));
+    console.log(forgot.rows + ' skipped or unplaced attachments in ' + forgot.threads + ' emails will be looked ' +
+      'at again, starting with the next run (or run processBills now).' +
       (forgot.unfinished ? ' Not finished yet: run retrySkipped again for the rest.' : ''));
   } finally {
     if (ownClock) clock_.started = null;
   }
+}
+
+// Log rows written by the given time that were skipped or left in _Needs Review.
+function unplaced_(before) {
+  const result = LOG_HEADERS.indexOf('Result');
+  const processed = LOG_HEADERS.indexOf('Processed');
+  return (row) => (String(row[result]) === 'Skipped' || String(row[result]) === 'Needs review') &&
+    new Date(row[processed]).getTime() <= before;
+}
+
+// Once per change of RULES, what the old rules skipped or couldn't place goes back to be sorted
+// again. If that takes longer than one run, the next run carries on.
+function resortAfterUpdate_(ctx) {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('rules') === RULES) return;
+  const before = Number(props.getProperty('resortBefore')) || new Date().getTime();
+  props.setProperty('resortBefore', String(before));
+  const forgot = forgetRows_(ctx, unplaced_(before));
+  if (forgot.rows) {
+    console.log('New version: ' + forgot.rows + ' attachments that were skipped or left for review are looked at again.');
+    remember_(ctx);
+  }
+  if (forgot.unfinished) return;
+  props.setProperty('rules', RULES);
+  props.deleteProperty('resortBefore');
 }
 
 /**
@@ -325,11 +357,15 @@ function checkMessage_(thread, message, ctx, searched, logged) {
     ', "' + message.getSubject() + '"'];
   const labelled = thread.getLabels().some((l) => l.getName() === CONFIG.LABEL);
   const inLog = Object.keys(logged).some((key) => key.indexOf(message.getId() + ':') === 0);
+  const recent = message.getDate().getTime() >= today_().getTime() - CONFIG.LOOK_BACK_DAYS * DAY;
   lines.push('  Found by the hourly search: ' + (searched[thread.getId()] ? 'yes.' : 'NO. Nothing in it matches ' +
     'SEARCH_TERMS or your account numbers; add a word from the email to SEARCH_TERMS.'));
-  lines.push('  Bill Records label: ' + (labelled ? 'yes, so the hourly runs leave it alone.' : 'no.') +
-    (labelled && !inLog ? ' It is not in the Log, so something else labelled it: the old script, if it still ' +
-      'runs in another project. Remove the label to have it sorted.' : ''));
+  let label = labelled ? 'yes.' : 'no.';
+  if (labelled && !inLog) {
+    label = recent ? 'yes, but it is not in the Log yet, so the next run sorts it anyway.'
+      : 'yes, and it is older than LOOK_BACK_DAYS, so it is left alone. Remove the label to have it sorted.';
+  }
+  lines.push('  Bill Records label: ' + label);
   const items = billAttachments_(message);
   items.forEach((item) => {
     item.count = items.length;
@@ -512,9 +548,11 @@ function todayKey_() {
 
 // ─── One run ─────────────────────────────────────────────────────────────────
 
-// Works through the search 50 threads at a time until the time is up or nothing is left.
+// Works through the search 50 threads at a time until the time is up or nothing is left, then
+// through conversations that already have the label, for emails Gmail labelled on arrival.
 function runBatch_() {
   const ctx = openContext_();
+  resortAfterUpdate_(ctx);
   const query = buildQuery_(ctx.properties);
   const tried = {};
   const tally = {};
@@ -537,6 +575,7 @@ function runBatch_() {
     }
   }
   if (!finished) finished = !GmailApp.search(query, 0, 1).length;
+  if (finished) finished = sweepLabelled_(ctx, tried, tally);
   const counts = Object.keys(tally).map((result) => tally[result] + ' ' + result.toLowerCase()).join(', ');
   console.log((counts || 'Nothing new') + ' in ' + Math.round(elapsedMs_() / 1000) + 's. ' +
     (finished ? 'All caught up.' : 'More to do; the next run carries on from here.'));
@@ -555,14 +594,78 @@ function buildQuery_(properties, labelledToo) {
     (CONFIG.SEARCH_SINCE ? ' after:' + CONFIG.SEARCH_SINCE : '');
 }
 
+const DAY = 24 * 60 * 60 * 1000;
+
+// Today's date. Its own function so the tests can fix it.
+function today_() {
+  return new Date();
+}
+
+// Gmail gives a conversation's labels to emails that arrive in it later, and MGL, for one, sends
+// every bill under the same subject, so each new bill lands in an old conversation already
+// labelled and the search above never sees it. So conversations with the label are looked
+// through as well, for emails the Log doesn't have: from the last LOOK_BACK_DAYS the first time,
+// and after that from just before the previous look. Where it got to is kept, so a long first
+// look is spread over several runs. True when it got to the end.
+function sweepLabelled_(ctx, tried, tally) {
+  const props = PropertiesService.getScriptProperties();
+  if (!props.getProperty('sweepFrom')) {
+    const last = Number(props.getProperty('sweptTo') || 0);
+    props.setProperties({
+      sweepFrom: String(last ? last - 2 * DAY : today_().getTime() - CONFIG.LOOK_BACK_DAYS * DAY),
+      sweepStarted: String(today_().getTime()),
+      sweepAt: '0',
+      sweepRetry: 'no',
+    });
+  }
+  const from = Number(props.getProperty('sweepFrom'));
+  let at = Number(props.getProperty('sweepAt') || 0);
+  let retry = props.getProperty('sweepRetry') === 'yes';
+  const query = buildQuery_(ctx.properties, true) + ' after:' +
+    Utilities.formatDate(new Date(from), CONFIG.TIME_ZONE, 'yyyy/MM/dd');
+  let finished = false;
+  let stopped = false;
+  while (!finished && !stopped && !past_(CONFIG.RUN_MINUTES)) {
+    const page = GmailApp.search(query, at, 50);
+    for (let i = 0; i < page.length; i++) {
+      if (past_(CONFIG.RUN_MINUTES)) {
+        stopped = true;
+        break;
+      }
+      if (!tried[page[i].getId()]) {
+        tried[page[i].getId()] = true;
+        const state = processThread_(page[i], ctx, tally, from);
+        if (state === 'later') {
+          stopped = true;
+          break;
+        }
+        if (state === 'retry') retry = true;
+        if (state === 'done') page[i].addLabel(ctx.label);
+      }
+      at++;
+    }
+    if (page.length < 50 && !stopped) finished = true;
+  }
+  if (!finished) {
+    props.setProperties({ sweepAt: String(at), sweepRetry: retry ? 'yes' : 'no' });
+    return false;
+  }
+  // After an error the next look starts from the same place, so that email is tried again.
+  props.setProperty('sweptTo', String(retry ? from + 2 * DAY : Number(props.getProperty('sweepStarted'))));
+  ['sweepFrom', 'sweepStarted', 'sweepAt', 'sweepRetry'].forEach((k) => props.deleteProperty(k));
+  return true;
+}
+
 // Returns 'done' when every email in the thread is handled and it can be labelled, 'retry'
-// after an error worth trying again, and 'later' when time ran out part way through.
-function processThread_(thread, ctx, tally) {
+// after an error worth trying again, and 'later' when time ran out part way through. Emails from
+// before since (a time) are left alone.
+function processThread_(thread, ctx, tally, since) {
   let failed = false;
   const messages = thread.getMessages();
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
     if (ctx.doneMessages.has(message.getId())) continue; // handled on an earlier run
+    if (since && message.getDate().getTime() < since) continue;
     if (past_(CONFIG.RUN_MINUTES)) return 'later';
     const state = processMessage_(message, thread, ctx, tally);
     if (state === 'later') return 'later';
@@ -704,7 +807,8 @@ function handleAttachment_(message, item, ctx) {
   // are told apart by account or bill number, not "(2)".
   const tag = v.utility.recurring && v.accountId ? v.accountId : v.billNo ? 'No ' + v.billNo.toUpperCase() : '';
   const altBase = tag ? v.fileBase + ' - ' + tag : '';
-  const saved = saveFile_(ctx, target, blob, v.fileBase, extension_(item), item.hash, message.getId(), altBase);
+  const saved = saveFile_(ctx, target, blob, v.fileBase, extension_(item), item.hash, message.getId(), altBase,
+    Boolean(property));
   const propertyName = property ? property.name : CONFIG.NEEDS_REVIEW;
   if (!saved.duplicate) rememberBill_(ctx, v, propertyName, message.getDate(), saved.url);
   let result = 'Filed';
@@ -1357,15 +1461,20 @@ function openContext_() {
     folders: {},
   };
   ctx.properties = loadProperties_(ctx, props);
+  remember_(ctx);
+  return ctx;
+}
+
+// What earlier runs did, from the Log, and the emails retrySkipped wants looked at again though
+// the Log shows a bill filed from them.
+function remember_(ctx) {
   Object.assign(ctx, loadMemory_(ctx.logSheet));
-  // Emails retrySkipped wants looked at again, though the log shows a bill filed from them.
   ctx.recheck = {};
-  props.getKeys().forEach((k) => {
+  PropertiesService.getScriptProperties().getKeys().forEach((k) => {
     if (k.indexOf('recheck:') !== 0) return;
     ctx.recheck[k.slice(8)] = true;
     ctx.doneMessages.delete(k.slice(8));
   });
-  return ctx;
 }
 
 // Your own address, so bills you forward to yourself are always looked at properly.
@@ -1557,34 +1666,52 @@ function childFolder_(parent, name) {
 // folder: the log knows most of them, Drive's search finds the rest by the fingerprint in their
 // description, and a file a cut-off run saved moments ago is found by its name. A different bill
 // that wants a taken name gets altBase (the name with its account number) or " (2)", " (3)".
-function saveFile_(ctx, folder, blob, base, ext, hash, messageId, altBase) {
+// placed: it goes to a property, so a copy this same email left in _Needs Review moves there.
+function saveFile_(ctx, folder, blob, base, ext, hash, messageId, altBase, placed) {
   if (ctx.filed[hash]) return { url: ctx.filed[hash], duplicate: true };
   const elsewhere = filedCopy_(hash);
-  if (elsewhere) return sameFile_(ctx, elsewhere, hash, messageId);
+  if (elsewhere) {
+    const same = sameFile_(ctx, elsewhere, hash, messageId);
+    if (!same.duplicate && placed && !inFolder_(elsewhere, folder)) {
+      const spot = freeName_(folder, base, ext, altBase, hash);
+      if (spot.name) elsewhere.setName(spot.name);
+      elsewhere.moveTo(folder);
+    }
+    return same;
+  }
+  const spot = freeName_(folder, base, ext, altBase, hash);
+  if (spot.file) return sameFile_(ctx, spot.file, hash, messageId);
+  const file = folder.createFile(blob.setName(spot.name));
+  file.setDescription('Filed by Bill Sorter from Gmail message ' + messageId + '. sha1=' + hash);
+  ctx.filed[hash] = file.getUrl();
+  return { url: ctx.filed[hash], duplicate: false };
+}
+
+// The first of base, altBase, altBase (2)… (or base (2), base (3)…) free in the folder, or the
+// file already there under one of them with this fingerprint.
+function freeName_(folder, base, ext, altBase, hash) {
   const nameAt = (i) => {
     if (i === 0) return base + ext;
     if (altBase) return (i === 1 ? altBase : altBase + ' (' + i + ')') + ext;
     return base + ' (' + (i + 1) + ')' + ext;
   };
-  let finalName = nameAt(0);
-  for (let i = 1; ; i++) {
-    const sameName = folder.getFilesByName(finalName);
+  for (let i = 0; ; i++) {
+    const sameName = folder.getFilesByName(nameAt(i));
     let taken = false;
     while (sameName.hasNext()) {
       const file = sameName.next();
       if (file.isTrashed()) continue;
+      if (String(file.getDescription() || '').indexOf('sha1=' + hash) !== -1) return { file: file };
       taken = true;
-      if (String(file.getDescription() || '').indexOf('sha1=' + hash) !== -1) {
-        return sameFile_(ctx, file, hash, messageId);
-      }
     }
-    if (!taken) break;
-    finalName = nameAt(i);
+    if (!taken) return { name: nameAt(i) };
   }
-  const file = folder.createFile(blob.setName(finalName));
-  file.setDescription('Filed by Bill Sorter from Gmail message ' + messageId + '. sha1=' + hash);
-  ctx.filed[hash] = file.getUrl();
-  return { url: ctx.filed[hash], duplicate: false };
+}
+
+function inFolder_(file, folder) {
+  const parents = file.getParents();
+  while (parents.hasNext()) if (parents.next().getId() === folder.getId()) return true;
+  return false;
 }
 
 // An existing copy of the file. If it was saved for this same email by a run that ran out of
