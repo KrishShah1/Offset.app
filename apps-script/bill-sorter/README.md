@@ -66,6 +66,12 @@ next run picks it up.
   the new row, and move its files across in Drive.
 - An account number always beats a keyword. Keywords match whole words only, so `f-34` matches
   "F-34, Sej Plaza" but not "a bill of 3,450".
+- **A keyword can be a sender.** Some companies' emails never show your account number: MGL's
+  only has it inside the PDF, so if Drive can't read the PDF the bill can't be placed. If such a
+  company serves just one of your properties, put its address in that property's keywords, e.g.
+  `mahanagargas.com`, and its bills go there whether or not the PDF can be read. Don't do this for
+  a company that serves several of your properties.
+- Account numbers can be typed as printed: `2100 0080 0764` is read as one number.
 
 **Log tab.** Every attachment it looked at, with a link to the file and the email, the month and
 financial year it chose and why, and what it matched on. The results:
@@ -104,6 +110,12 @@ Only property bills. An attachment is filed when all of these hold:
   sheet, so your own mobile stays out; broadband and landline bills go by address like the rest.
 
 Every attachment it skips is in the Log tab with the reason in the Notes column.
+
+**If a bill isn't being filed,** set `CHECK_SEARCH` in `CONFIG` to a Gmail search that finds it
+(it starts as `from:mahanagargas.com`), choose **checkEmails** in the function list and click
+**Run**. The Execution log shows, for the latest few emails it finds, whether the hourly search
+picks them up, whether they already have the `Bill Records` label, what the Log tab says, what Drive
+could read from each attachment, and where it would go now. It files and changes nothing.
 
 **If a bill was skipped that shouldn't have been,** fix the reason (usually: add its account
 number or a keyword to the property's row), then choose **retrySkipped** in the function list and

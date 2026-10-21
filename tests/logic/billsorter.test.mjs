@@ -132,9 +132,14 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
     },
     getThreadById: (id) => threads.find((t) => t.id === id) || null,
     // Gmail matches messages, so a thread comes back while any message in it lacks the label.
+    // Of the rest of a query only from: is honoured (from:me aside); the word list matches anything.
     search: (query, start, max) => {
       w.queries.push(query)
-      return threads.filter((t) => t.messages.some((m) => !m.labels.has(w.label))).slice(start, start + max)
+      const senders = [...query.matchAll(/(?:^|[\s(])from:([^\s()]+)/g)].map((x) => x[1].toLowerCase()).filter((x) => x !== 'me')
+      return threads
+        .filter((t) => !/-label:/.test(query) || t.messages.some((m) => !m.labels.has(w.label)))
+        .filter((t) => !senders.length || t.messages.some((m) => senders.some((x) => m.from.toLowerCase().includes(x))))
+        .slice(start, start + max)
     },
   }
   const attachment = (a) => ({
@@ -160,6 +165,7 @@ function makeWorld({ driveVersion = 3, withDrive = true } = {}) {
     const t = { id: nextId('thread'), messages: msgs.map(message) }
     Object.assign(t, {
       getId: () => t.id, getMessages: () => t.messages,
+      getLabels: () => [...new Set(t.messages.flatMap((m) => [...m.labels]))].map((n) => ({ getName: () => n })),
       getPermalink: () => `https://mail.google.com/mail/#all/${t.id}`,
       addLabel: (l) => { t.messages.forEach((m) => m.labels.add(l.getName())); return t },
       receive: (m) => { t.messages.push(message(m)); return t },
@@ -957,6 +963,65 @@ console.log('\n── REAL BILLS STILL GET THROUGH ──')
   ok('a car service invoice with your address stays out', /^Skipped/.test(why('Service.pdf')), why('Service.pdf'))
   ok('an online order for plumbing tape stays out', /^Skipped/.test(why('Order.pdf')), why('Order.pdf'))
   eq('nothing else is filed', filed.filter((p) => !p.endsWith('Bill Sorter Settings')).length, 7)
+}
+
+console.log('\n── MGL GAS BILLS ──')
+{
+  // MGL's email never shows the CA number: only the PDF does, so the PDF has to be read
+  const MGL = 'pngbill@mahanagargas.com'
+  const BODY = 'Dear MGL PNG consumer,\nPlease find the PNG bill for the bill dated 22/09/2026. The file attached is in pdf ' +
+    'which is easy to read and store.\nThe bill has a due date of 12/10/2026 , with a due amount of Rs. 2932.00.\n' +
+    'Please Pay on or before due date by using any of the payment options.\nRegards,\nMGL Team'
+  const bill = (period, billDate, invoice) => `TAX INVOICE\nMAHANAGAR GAS LIMITED\nwww.mahanagargas.com\nCA Number : 2100 0080 0764
+BILL DATE : ${billDate}\nPERIOD : ${period}\n2932 Amount Payable 12/10/2026\nMR K SHAH
+2, MOTHER'S LOVE, PANKAJ CHS, EVERSHINE NAGAR, MALAD WEST, MUMBAI 400064\nMVAT Invoice No. ${invoice}
+SALE OF NATURAL GAS\nGas Consumption SCM (Standard cubic meter) 52.00\nMeter Reading 1234 to 1286\nTOTAL CHARGES A 2752.98`
+  const g = makeWorld()
+  const sep = g.thread({ from: MGL, subject: 'PNG Bill', date: '2026-09-22T13:13:00+05:30', body: BODY,
+    attachments: [pdf("Ebill_SEP'26.pdf", bill('22/07/2026 to 22/09/2026', '22/09/2026', '2106005202609'))] })
+  g.thread({ from: MGL, subject: 'PNG Bill', date: '2026-11-22T13:13:00+05:30', body: BODY,
+    attachments: [pdf("Ebill_NOV'26.pdf", '', { unreadable: true })] })
+  // the same kind of bill forwarded from someone else's address
+  g.thread({ from: 'Family <family@example.com>', subject: 'Fwd: PNG Bill', date: '2026-07-25T09:00:00+05:30', body: 'see attached',
+    attachments: [pdf("Ebill_JUL'26.pdf", bill('22/05/2026 to 22/07/2026', '22/07/2026', '2106005202607'))] })
+  g.run('processBills()')
+  const res = (name) => g.log().find((r) => r.Attachment === name) || {}
+  has('the bill in the screenshot is filed with its property, by the CA number on the PDF', g.paths(),
+    P(ML, 'Gas Bills', 'FY 2026-27', '2026-09 September 2026 Gas Bill.pdf'))
+  eq('matched by its account, printed in groups', res("Ebill_SEP'26.pdf")['Matched by'].split(',')[0], 'account 210000800764')
+  has('a forwarded one named "Ebill" is still a gas bill, not electricity', g.paths(),
+    P(ML, 'Gas Bills', 'FY 2026-27', '2026-07 July 2026 Gas Bill.pdf'))
+  eq('one whose PDF cannot be read has nothing to place it by', res("Ebill_NOV'26.pdf").Result, 'Needs review')
+
+  // with MGL's address as a keyword of the property, an unreadable one is placed too
+  g.tab('Properties').rows[1][2] += ', mahanagargas.com'
+  g.thread({ from: MGL, subject: 'PNG Bill', date: '2027-01-22T13:13:00+05:30', body: BODY,
+    attachments: [pdf("Ebill_JAN'27.pdf", '', { unreadable: true })] })
+  g.run('processBills()')
+  eq('a sender in the keywords places an unreadable bill', res("Ebill_JAN'27.pdf").Property, ML)
+  ok('and says why', /mahanagargas\.com/.test(res("Ebill_JAN'27.pdf")['Matched by']), res("Ebill_JAN'27.pdf")['Matched by'])
+
+  eq('an account typed in groups in the sheet is one number', [...fn('splitAccounts_')('2100 0080 0764')].join(), '210000800764')
+  eq('beside others', [...fn('splitAccounts_')('102401902 2100 0080 0764; 153541273')].join(), '102401902,210000800764,153541273')
+
+  // checkEmails explains, and changes nothing
+  sep.addLabel({ getName: () => 'Bill Records' })
+  const lost = g.thread({ from: MGL, subject: 'PNG Bill', date: '2027-03-22T13:13:00+05:30', body: BODY,
+    attachments: [pdf("Ebill_MAR'27.pdf", bill('22/01/2027 to 22/03/2027', '22/03/2027', '2106005202703'))] })
+  lost.addLabel({ getName: () => 'Bill Records' }) // labelled by something else, never looked at
+  const filesBefore = g.paths().length
+  const logBefore = g.log().length
+  g.logs.length = 0
+  g.run('checkEmails()')
+  const out = g.logs.join('\n')
+  ok('checkEmails reports each email it finds', /PNG Bill/.test(out) && /Ebill_SEP'26\.pdf/.test(out), out)
+  ok('what the Log says about it', /In the Log: Filed/.test(out), out)
+  ok('what it read from the PDF', /Opened: yes, \d+ characters read: "tax invoice mahanagar gas/.test(out), out)
+  ok('and where it would go now', /Now it would be filed in 2, Mother's Love, \(Malad West\) \/ Gas Bills \/ FY 2026-27/.test(out), out)
+  ok('an email labelled by something else is called out', /not in the Log, so something else labelled it/.test(out), out)
+  ok('an unreadable PDF says so', /Opened: Couldn't read the attachment itself/.test(out), out)
+  eq('nothing is filed', g.paths().length, filesBefore)
+  eq('or logged', g.log().length, logBefore)
 }
 
 console.log('\n── LOOKING AGAIN AT WHAT WAS SKIPPED ──')

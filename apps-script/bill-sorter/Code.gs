@@ -64,6 +64,8 @@ const CONFIG = {
     'minimum amount due', 'credit limit', 'order id', 'sold by', 'ship to', 'shipping address', 'chassis',
     'odometer'],
   SAME_BILL_DAYS: 7,                     // two copies of one account's bill this close together are one bill
+  // What checkEmails looks at: a Gmail search for emails you expected to see filed.
+  CHECK_SEARCH: 'from:mahanagargas.com',
 };
 
 // Used once, to fill the Properties tab the first time the script runs. After that the
@@ -106,7 +108,7 @@ const UTILITIES = [
     recurring: true,
     senders: ['adani', 'tatapower', 'bestundertaking', 'mahadiscom', 'mahavitaran', 'torrentpower'],
     keywords: ['electricity', 'adani electricity', 'tata power', 'best undertaking', 'mahavitaran', 'msedcl',
-      'torrent power', 'energy charges', 'units consumed', 'kwh', 'meter reading', 'sanctioned load', 'ebill'],
+      'torrent power', 'energy charges', 'units consumed', 'kwh', 'meter reading', 'sanctioned load'],
   },
   {
     folder: 'Gas Bills', label: 'Gas Bill', short: 'Gas', inArrears: true, newProperty: true,
@@ -285,6 +287,87 @@ function retrySkipped() {
   }
 }
 
+/**
+ * Run by hand to see why some emails are or aren't being filed. Set CHECK_SEARCH in CONFIG to a
+ * Gmail search that finds them (it starts as MGL's gas bills), run checkEmails, and read the
+ * Execution log. For the latest few it says whether the hourly search finds them, what the Log
+ * tab says about them, whether each attachment can be read, and what would be done with it now.
+ * It files, labels and logs nothing.
+ */
+function checkEmails() {
+  const ownClock = startClock_();
+  try {
+    const ctx = openContext_();
+    const messages = [];
+    GmailApp.search(CONFIG.CHECK_SEARCH + ' has:attachment', 0, 5).forEach((thread) => {
+      thread.getMessages().forEach((message) => messages.push({ thread: thread, message: message }));
+    });
+    if (!messages.length) {
+      console.log('No email with an attachment matches ' + CONFIG.CHECK_SEARCH + '. Change CHECK_SEARCH in CONFIG.');
+      return;
+    }
+    const searched = {};
+    GmailApp.search(buildQuery_(ctx.properties, true) + ' ' + CONFIG.CHECK_SEARCH, 0, 100).forEach((t) => {
+      searched[t.getId()] = true;
+    });
+    const logged = logRows_(ctx);
+    messages.sort((a, b) => b.message.getDate() - a.message.getDate());
+    messages.slice(0, 5).forEach((m) => {
+      if (!past_(CONFIG.RUN_MINUTES)) checkMessage_(m.thread, m.message, ctx, searched, logged);
+    });
+  } finally {
+    if (ownClock) clock_.started = null;
+  }
+}
+
+function checkMessage_(thread, message, ctx, searched, logged) {
+  const lines = [Utilities.formatDate(message.getDate(), CONFIG.TIME_ZONE, 'd MMM yyyy') + ', ' + message.getFrom() +
+    ', "' + message.getSubject() + '"'];
+  const labelled = thread.getLabels().some((l) => l.getName() === CONFIG.LABEL);
+  const inLog = Object.keys(logged).some((key) => key.indexOf(message.getId() + ':') === 0);
+  lines.push('  Found by the hourly search: ' + (searched[thread.getId()] ? 'yes.' : 'NO. Nothing in it matches ' +
+    'SEARCH_TERMS or your account numbers; add a word from the email to SEARCH_TERMS.'));
+  lines.push('  Bill Records label: ' + (labelled ? 'yes, so the hourly runs leave it alone.' : 'no.') +
+    (labelled && !inLog ? ' It is not in the Log, so something else labelled it: the old script, if it still ' +
+      'runs in another project. Remove the label to have it sorted.' : ''));
+  const items = billAttachments_(message);
+  items.forEach((item) => {
+    item.count = items.length;
+    lines.push('  ' + item.name + ' (' + item.type + ', ' + Math.round(item.size / 1024) + ' KB)');
+    const row = logged[message.getId() + ':' + item.hash];
+    lines.push('    In the Log: ' + (row ? row.result + '.' + (row.notes ? ' ' + row.notes : '') : 'not there.'));
+    const j = judge_(message, item, ctx);
+    if (!j) {
+      lines.push('    Out of time before opening it; run checkEmails again.');
+      return;
+    }
+    lines.push('    Opened: ' + (j.texts.doc ? 'yes, ' + j.texts.doc.length + ' characters read: "' +
+      j.texts.doc.slice(0, 300) + '…"' : j.note || 'no, the email was enough.'));
+    const v = j.v;
+    const where = (top) => top + ' / ' + v.utility.folder + ' / ' + v.fy + ' as "' + v.fileBase + '"';
+    let now = 'skipped. ' + v.notes;
+    if (v.action === 'file') now = 'filed in ' + where(v.match.property.name) + ', matched by ' + v.match.why + '.';
+    if (v.action === 'new') now = 'filed as a new property for account ' + v.account + '.';
+    if (v.action === 'review') now = 'put in ' + where(CONFIG.NEEDS_REVIEW) + '. ' + v.notes;
+    lines.push('    Now it would be ' + now);
+  });
+  if (!items.length) lines.push('  No PDF or photo attachment big enough to be a bill.');
+  console.log(lines.join('\n'));
+}
+
+// The Log tab's rows by key (message id : file fingerprint), with their result and notes.
+function logRows_(ctx) {
+  const rows = {};
+  const last = ctx.logSheet.getLastRow();
+  if (last < 2) return rows;
+  const col = (name) => LOG_HEADERS.indexOf(name);
+  ctx.logSheet.getRange(2, 1, last - 1, LOG_HEADERS.length).getValues().forEach((row) => {
+    const key = String(row[col('Key')] || '').replace(/:error$/, '');
+    rows[key] = { result: String(row[col('Result')]), notes: String(row[col('Notes')] || '') };
+  });
+  return rows;
+}
+
 // Takes the log rows that pass the test out of the Log tab and the Bill Records label off their
 // emails, so the next runs sort those attachments again. An email that keeps other rows (a bill
 // filed beside a skipped leaflet) is marked to be looked at again, or it would count as finished.
@@ -459,13 +542,14 @@ function runBatch_() {
     (finished ? 'All caught up.' : 'More to do; the next run carries on from here.'));
 }
 
-function buildQuery_(properties) {
+// The hourly search; labelledToo leaves out "not already handled", for checkEmails.
+function buildQuery_(properties, labelledToo) {
   const terms = CONFIG.SEARCH_TERMS.map((term) => (/\s/.test(term) ? '"' + term + '"' : term));
   properties.forEach((p) => p.accounts.forEach((account) => terms.push(account)));
   terms.push('(from:me bill)');
   // Gmail's search spells a label with spaces as hyphens: "Bill Records" → label:bill-records
   const label = CONFIG.LABEL.toLowerCase().replace(/\s+/g, '-');
-  return 'has:attachment -label:' + label +
+  return 'has:attachment' + (labelledToo ? '' : ' -label:' + label) +
     ' (filename:pdf OR filename:jpg OR filename:jpeg OR filename:png)' +
     ' (' + terms.join(' OR ') + ')' +
     (CONFIG.SEARCH_SINCE ? ' after:' + CONFIG.SEARCH_SINCE : '');
@@ -580,35 +664,18 @@ function billType_(contentType, name) {
   return null;
 }
 
-// Sorts one attachment, opening it only if the email alone isn't enough. Returns null when it
-// needs opening but the run is too close to its time limit to start, so it waits for next run.
+// Sorts one attachment. Returns null when it needs opening but the run is too close to its time
+// limit to start, so it waits for next run.
 function handleAttachment_(message, item, ctx) {
-  const blob = item.attachment.copyBlob().setContentType(item.type);
-  const texts = textsFor_(message, item, '');
-  let v = classify_(texts, ctx.properties, message.getDate());
-  let note = '';
-  if (wantsReading_(v, texts, item, ctx)) {
-    const tooMuch = tooMuchToRead_(blob, item);
-    if (tooMuch) {
-      note = 'Not opened (' + tooMuch + '), so this is based on the email.';
-    } else if (past_(CONFIG.READ_CUTOFF_MINUTES)) {
-      return null;
-    } else {
-      const read = readText_(blob, item.name);
-      if (read.error) {
-        note = "Couldn't read the attachment itself (" + read.error + '), so this is based on the email.';
-      } else {
-        texts.doc = normalize_(read.text).slice(0, 30000); // a bill's details are on its first pages
-      }
-    }
-    texts.unread = texts.doc.length < 40;
-    v = classify_(texts, ctx.properties, message.getDate());
-  }
+  const j = judge_(message, item, ctx);
+  if (!j) return null;
+  const v = j.v;
+  const blob = j.blob;
   const outcome = {
     utility: v.utility.folder,
     fy: v.fy,
     month: MONTHS[v.month.m] + ' ' + v.month.y + ' (' + v.month.how + ')',
-    notes: [v.notes, note].filter(Boolean).join(' '),
+    notes: [v.notes, j.note].filter(Boolean).join(' '),
     account: v.accountId,
     billNo: v.billNo,
   };
@@ -650,6 +717,36 @@ function handleAttachment_(message, item, ctx) {
     matchedBy: v.action === 'new' ? 'new account ' + v.account : v.action === 'file' ? v.match.why : '',
     url: saved.url,
   });
+}
+
+// What to do with one attachment, opening it only if the email alone isn't enough. Returns null
+// when it needs opening but the run is too close to its time limit to start.
+function judge_(message, item, ctx) {
+  const blob = item.attachment.copyBlob().setContentType(item.type);
+  const texts = textsFor_(message, item, '');
+  let v = classify_(texts, ctx.properties, message.getDate());
+  let note = '';
+  if (wantsReading_(v, texts, item, ctx)) {
+    const tooMuch = tooMuchToRead_(blob, item);
+    if (tooMuch) {
+      note = 'Not opened (' + tooMuch + '), so this is based on the email.';
+    } else if (past_(CONFIG.READ_CUTOFF_MINUTES)) {
+      return null;
+    } else {
+      const read = readText_(blob, item.name);
+      if (read.error) {
+        note = "Couldn't read the attachment itself (" + read.error + '), so this is based on the email.';
+      } else {
+        texts.doc = normalize_(read.text).slice(0, 30000); // a bill's details are on its first pages
+        if (texts.doc.length < 40) {
+          note = 'Drive read almost no text from the attachment, so this is based on the email.';
+        }
+      }
+    }
+    texts.unread = texts.doc.length < 40;
+    v = classify_(texts, ctx.properties, message.getDate());
+  }
+  return { blob: blob, texts: texts, v: v, note: note };
 }
 
 // Whether to open the attachment. Not when the email already names one of your account numbers
@@ -711,7 +808,7 @@ function extension_(item) {
 function readText_(blob, name) {
   let id = null;
   try {
-    const title = 'Bill Sorter OCR - ' + name;
+    const title = 'Bill Sorter OCR - ' + String(name).replace(/[^\w. -]+/g, '');
     if (typeof Drive.Files.create === 'function') {
       // Drive API v3: asking for a Google Doc is what turns the conversion (and OCR) on.
       id = Drive.Files.create({ name: title, mimeType: MimeType.GOOGLE_DOCS }, blob,
@@ -925,9 +1022,10 @@ function patternsFor_(utility) {
 
 // An account number is the strongest evidence; a keyword (building, flat, road) counts for
 // much less, and less again when it is only in the email body (which may hold your own
-// address). Two properties scoring the same is reported as ambiguous instead of guessed.
+// address). A keyword can also be a sender, "mahanagargas.com" say, for a company whose emails
+// never show the account number. Two properties scoring the same is reported as ambiguous.
 function matchProperty_(t, properties) {
-  const strong = t.doc + ' \n ' + t.subject + ' \n ' + t.file;
+  const strong = t.doc + ' \n ' + t.subject + ' \n ' + t.file + ' \n ' + t.from;
   const scored = [];
   properties.forEach((p) => {
     let score = 0;
@@ -1367,10 +1465,24 @@ function loadProperties_(ctx, props) {
   return list;
 }
 
+// Account numbers separated by commas, semicolons, new lines or spaces. One printed in groups,
+// like "2100 0080 0764", is one number: groups shorter than six digits are joined up.
 function splitAccounts_(cell) {
-  return String(cell || '').split(/[,;\s]+/)
-    .map((part) => part.replace(/\D/g, ''))
-    .filter((digits) => digits.length >= 6);
+  const accounts = [];
+  String(cell || '').split(/[,;\n]+/).forEach((part) => {
+    let run = '';
+    part.split(/\s+/).map((group) => group.replace(/\D/g, '')).filter(Boolean).forEach((group) => {
+      if (group.length < 6) {
+        run += group;
+        return;
+      }
+      if (run) accounts.push(run);
+      run = '';
+      accounts.push(group);
+    });
+    if (run) accounts.push(run);
+  });
+  return accounts.filter((digits) => digits.length >= 6);
 }
 
 function splitKeywords_(cell) {
